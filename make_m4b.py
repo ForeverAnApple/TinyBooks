@@ -88,6 +88,7 @@ FALLBACK_CHANNELS = 2
 FALLBACK_BITRATE = 64000  # bps, if we can't read it off the source
 AUDIO_EXTS = {".mp3"}  # expand here if you add flac/wav/m4a source support
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+NFO_EXT = ".nfo"
 
 
 def natural_sort_key(path: Path):
@@ -109,6 +110,20 @@ def ffmetadata_escape(value: str) -> str:
         .replace("\n", " ")
         .replace("\r", " ")
     )
+
+
+def ffmetadata_escape_multiline(value: str) -> str:
+    """Like ffmetadata_escape, but preserves newlines as FFMETADATA line
+    continuations (`\\` + LF). Use for description/comment, where collapsing
+    paragraphs to a single line would mangle the displayed text."""
+    value = (
+        value.replace("\\", "\\\\")
+        .replace(";", r"\;")
+        .replace("#", r"\#")
+        .replace("=", r"\=")
+    )
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    return value.replace("\n", "\\\n")
 
 
 def probe_stream(file_path):
@@ -241,6 +256,80 @@ def parse_cue(path: Path):
         tracks.append(current)
     # Drop tracks without a start timestamp (malformed cue); keep sort stable.
     return [t for t in tracks if t["start"] is not None]
+
+
+def find_nfo(directory: Path):
+    """Return the .nfo file in `directory`, or None. Multiple .nfo files are
+    rare in practice; if found, pick the first by natural sort and warn."""
+    nfos = sorted(
+        [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == NFO_EXT],
+        key=natural_sort_key,
+    )
+    if not nfos:
+        return None
+    if len(nfos) > 1:
+        print(f"⚠️ Multiple .nfo files in {directory.name}; using {nfos[0].name}")
+    return nfos[0]
+
+
+def parse_nfo(path: Path) -> dict:
+    """Parse a release-info nfo (KAZIN-style 'key: value' table plus a
+    'Book Description' block at the end). Returns a dict with keys:
+      title, author, narrator, publisher, genre, year, description, raw
+    Any field may be None if the nfo doesn't carry it. `raw` is the full file
+    text; suitable for stuffing into the m4b `comment` atom for archival.
+
+    Tolerant by design: unknown formats just yield mostly-None — caller falls
+    back to existing defaults."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    fields = {
+        "title": None, "author": None, "narrator": None,
+        "publisher": None, "genre": None, "year": None,
+        "description": None, "raw": text,
+    }
+
+    # `Key: value` lines, leading-space tolerant. KAZIN uses fixed-column
+    # alignment (`Title:                  ...`); .strip() handles it.
+    keymap = {
+        "title": "title",
+        "author": "author",
+        "read by": "narrator",
+        "narrator": "narrator",
+        "publisher": "publisher",
+        "genre": "genre",
+    }
+    for line in text.splitlines():
+        m = re.match(r"^\s*([A-Za-z][A-Za-z .]*?)\s*:\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        key = m.group(1).strip().lower()
+        val = m.group(2).strip()
+        target = keymap.get(key)
+        if target and not fields[target]:
+            fields[target] = val
+
+    # Year: prefer Original Publication (the work's year, not the audio rip
+    # year). Fall back to the (P) year inside Copyright if present.
+    m = re.search(r"^\s*Original Publication:\s+(\d{4})\b", text, re.MULTILINE)
+    if m:
+        fields["year"] = m.group(1)
+    else:
+        m = re.search(r"\(P\)\s*(\d{4})\b", text)
+        if m:
+            fields["year"] = m.group(1)
+
+    # Book Description block: everything after the section header, stripped.
+    # KAZIN format: header line "Book Description" followed by a row of "=".
+    m = re.search(
+        r"^Book Description\s*\n=+\s*\n(.+?)\Z",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if m:
+        fields["description"] = m.group(1).strip()
+
+    return fields
 
 
 def find_sidecar_cover(directory: Path):
@@ -400,10 +489,24 @@ def find_audio_files(directory: Path):
     )
 
 
-def build_metadata(title: str, author: str, chapters, enc_durations) -> str:
+def build_metadata(title, author, chapters, enc_durations, *,
+                   narrator=None, genre=None, year=None,
+                   description=None, comment=None) -> str:
     """chapters: list of (title, src, ss, to). enc_durations: matching list of
     measured post-encode durations in seconds — these are what actually ends
-    up in the concatenated m4b, so chapter marks line up with the audio."""
+    up in the concatenated m4b, so chapter marks line up with the audio.
+
+    Optional kwargs land in standard MP4 atoms via FFMETADATA:
+      narrator → composer (©wrt) — audiobook convention
+      genre → genre
+      year → date
+      description → desc (book blurb; what ABS displays)
+      comment → ©cmt (we use this for the full nfo dump)
+
+    NOT included: publisher, series. ffmpeg's ipod muxer silently drops the
+    `publisher` FFMETADATA key (no standard atom mapping), and series has no
+    standard MP4 atom at all. Both should be set via the Audiobookshelf API
+    when that path lands."""
     current_time_ms = 0
     lines = [
         ";FFMETADATA1",
@@ -411,8 +514,18 @@ def build_metadata(title: str, author: str, chapters, enc_durations) -> str:
         f"artist={ffmetadata_escape(author)}",
         f"album={ffmetadata_escape(title)}",
         "media_type=2",
-        "",
     ]
+    if narrator:
+        lines.append(f"composer={ffmetadata_escape(narrator)}")
+    if genre:
+        lines.append(f"genre={ffmetadata_escape(genre)}")
+    if year:
+        lines.append(f"date={ffmetadata_escape(year)}")
+    if description:
+        lines.append(f"description={ffmetadata_escape_multiline(description)}")
+    if comment:
+        lines.append(f"comment={ffmetadata_escape_multiline(comment)}")
+    lines.append("")
 
     for (chapter_title, _src, _ss, _to), duration in zip(chapters, enc_durations):
         duration_ms = round(duration * 1000)
@@ -439,6 +552,13 @@ def main():
     parser.add_argument("--cover", help="Path to cover art image")
     parser.add_argument("--title", help="Book title")
     parser.add_argument("--author", help="Author name")
+    parser.add_argument("--narrator", help="Narrator (goes in MP4 composer field)")
+    parser.add_argument("--year", help="Publication year (4 digits)")
+    parser.add_argument("--genre", help="Genre")
+    parser.add_argument("--description",
+                        help="Book blurb (single line; use --description-file for paragraphs)")
+    parser.add_argument("--description-file",
+                        help="Path to a text file containing the book blurb (paragraphs preserved)")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4,
                         help="Parallel encode workers (default: cpu count)")
 
@@ -448,10 +568,40 @@ def main():
     if not directory.is_dir():
         raise SystemExit(f"❌ Directory not found: {directory}")
 
+    # Pre-flag-resolution pass: pull what we can from a sidecar .nfo (KAZIN
+    # release info etc). Explicit --flag values still win over nfo values,
+    # which still win over directory-name / "Unknown Author" fallbacks.
+    nfo_path = find_nfo(directory)
+    nfo = parse_nfo(nfo_path) if nfo_path else {}
+    if nfo_path:
+        print(f"📝 Found nfo: {nfo_path.name}")
+
     output_file = args.output if args.output else f"{directory.name}.m4b"
-    title = args.title if args.title else directory.name
-    author = args.author if args.author else "Unknown Author"
+    title = args.title or nfo.get("title") or directory.name
+    author = args.author or nfo.get("author") or "Unknown Author"
+    narrator = args.narrator or nfo.get("narrator")
+    year = args.year or nfo.get("year")
+    genre = args.genre or nfo.get("genre")
+    if args.description_file:
+        description = Path(args.description_file).expanduser().read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+    else:
+        description = args.description or nfo.get("description")
+    # Stuff the full nfo into `comment` for archival when we have one. Without
+    # an nfo, leave comment empty (don't synthesize one — it's just noise).
+    comment = nfo.get("raw")
     cover_art = Path(args.cover).expanduser().resolve() if args.cover else None
+
+    # Visibility: surface what metadata will land in the m4b. Anything labelled
+    # "(missing)" should be filled before processing — see AGENTS.md.
+    print("📝 Metadata:")
+    for label, value in (
+        ("title", title), ("author", author), ("narrator", narrator),
+        ("year", year), ("genre", genre),
+        ("description", f"{len(description)} chars" if description else None),
+    ):
+        print(f"   {label:<12}{value if value else '(missing)'}")
 
     if cover_art and not cover_art.exists():
         print(f"⚠️ Cover art not found: {cover_art}. Proceeding without it.")
@@ -634,7 +784,14 @@ def main():
 
         metadata_path = tmpdir / "metadata.txt"
         metadata_path.write_text(
-            build_metadata(title, author, chapters, enc_durations),
+            build_metadata(
+                title, author, chapters, enc_durations,
+                narrator=narrator,
+                genre=genre,
+                year=year,
+                description=description,
+                comment=comment,
+            ),
             encoding="utf-8",
         )
 

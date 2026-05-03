@@ -34,6 +34,26 @@ A staging area for converting audiobook source material into m4b files using
   uses `directory.name` as the default title, so don't rename folders unless
   asked.
 
+### Output filename convention (`processed/`)
+
+Files in `processed/` follow this convention — the source folder name is
+typically not clean enough, so always pass `--output` rather than relying on
+the directory-name default.
+
+- **Standalone book**: `<Title>.m4b`
+  - e.g. `Neuromancer.m4b`, `Atlas Shrugged.m4b`, `Accelerando.m4b`
+- **Series book**: `<Title> - <Series>, Book <N>.m4b`
+  - e.g. `All These Worlds - Bobiverse, Book 3.m4b`,
+    `Consider Phlebas - Culture, Book 1.m4b`
+
+Rules:
+- Use the canonical book title (publisher's title), not the torrent name.
+- No author prefix in the filename — author lives in the m4b metadata.
+- No format/source cruft (`- MP3`, `(Unabridged)`, `[BT]`, etc.).
+- Keep the `.m4b` extension lowercase.
+- Don't rename existing files in `processed/` to match this convention without
+  being asked — the rule applies to *new* outputs.
+
 ## Running the converter
 
 `make_m4b.py` auto-detects three source layouts (no flag needed) — see its
@@ -54,11 +74,67 @@ python3 make_m4b.py "raw/Charles Stross  -  Accelerando.mp3" \
 #   put it in its own folder under raw/ first.
 ```
 
-Optional flags: `--title`, `--author`, `--cover <path>`, `--jobs <N>`.
+Optional flags: `--title`, `--author`, `--narrator`, `--year`, `--genre`,
+`--description`, `--description-file <path>`, `--cover <path>`, `--jobs <N>`.
 
 Cover art priority: `--cover` > sidecar image in source dir
 (`cover.*`/`folder.*`/`front.*` or the largest `.jpg`/`.png`/`.webp`) >
 embedded ID3 art on the first audio file.
+
+### Filling metadata before encoding
+
+**Every m4b in `processed/` must have a complete metadata set.** The script
+prints a `📝 Metadata:` block at startup listing each field; anything labelled
+`(missing)` should be filled before you run the encode for real. Bare-minimum
+(title + author from the directory name) is not acceptable for new builds —
+the goal is for Audiobookshelf to display a fully-populated entry from the
+embedded tags alone, with no manual cleanup after import.
+
+**Required fields** (the script will *let* you encode without them, but don't):
+
+- title, author, narrator, year, genre, description, cover art
+
+Sourcing strategy, in priority order:
+
+1. **Sidecar `.nfo` in the source dir.** The script auto-fills KAZIN-style
+   nfos (the common Audible-rip format — see `raw/05 Excession/*.nfo` for an
+   example). If one exists and parses cleanly, you're done.
+2. **Manual research → flags.** When no nfo exists, look up the book before
+   running the script:
+   - **Audible** → narrator, audio publisher, audio release year
+   - **Goodreads** → description, original publication year, genre
+   - **OpenLibrary / ISFDB / Wikipedia** → backup sources for year, genre,
+     publisher
+   Then pass via flags: `--narrator`, `--year`, `--genre`, plus
+   `--description-file <path>` for the blurb (multi-paragraph descriptions
+   read poorly on the CLI; put the text in a file).
+3. **Hand-written nfo.** For books you'll re-process or want to permanently
+   document, drop a minimal KAZIN-style nfo into the source dir. Future runs
+   pick it up automatically and you don't need to re-research.
+
+When you research metadata for option (2) or (3), **save it to disk** — write
+the description to `description.txt` or hand-roll an `.nfo` — so the next
+agent that touches this book doesn't have to redo the lookup.
+
+### Mapping from nfo / flags to MP4 atoms
+
+| Source                 | FFMETADATA key      | MP4 atom |
+| ---------------------- | ------------------- | -------- |
+| `Title:` / `--title`   | `title`, `album`    | ©nam, ©alb |
+| `Author:` / `--author` | `artist`            | ©ART     |
+| `Read By:` (or `Narrator:`) / `--narrator` | `composer` | ©wrt |
+| `Original Publication:` / `(P)<year>` / `--year` | `date` | ©day |
+| `Genre:` / `--genre`   | `genre`             | ©gen     |
+| `Book Description` block / `--description[-file]` | `description` | desc |
+| *whole nfo verbatim*   | `comment`           | ©cmt     |
+
+`Publisher:` is parsed but **not embedded** — ffmpeg's iPod muxer silently
+drops the `publisher` FFMETADATA key (no standard MP4 atom mapping). The
+extracted value sits unused; if you need publisher to surface, set it in
+Audiobookshelf directly after import.
+
+Precedence: explicit `--flag` > nfo field > built-in fallback (directory name
+for title, "Unknown Author" for author, omitted for everything else).
 
 ### Sourcing cover art
 
@@ -70,20 +146,28 @@ art with no retailer branding.
 "Only from Audible" corner ribbons, "AUDIOBOOK / MP3 AUDIO" frames, "Apple
 Books" overlays, etc.
 
-Two paths, depending on what's available:
+**Prefer square covers.** Three paths, in priority order:
 
-1. **Clean source exists** — try in order: publisher page, Amazon print/Kindle
-   ASIN (not the audio ASIN), OpenLibrary (`covers.openlibrary.org/b/isbn/<ISBN>-L.jpg`,
-   capped ~333×500), ISFDB wiki cover scans, artist's portfolio.
-2. **Only branded hi-res exists** (typical for Audible exclusives) — fetch the
-   2400×2400 master via the iTunes Lookup API
+1. **Clean square exists** — use it directly. Try in order: publisher page,
+   Amazon print/Kindle ASIN (not the audio ASIN), OpenLibrary
+   (`covers.openlibrary.org/b/isbn/<ISBN>-L.jpg`, capped ~333×500), ISFDB wiki
+   cover scans, artist's portfolio.
+2. **Clean rectangular exists** (typical: Goodreads/Kindle 2:3 portrait scans) —
+   feed it through the **`debrand-audiobook-cover`** skill
+   (`.claude/skills/debrand-audiobook-cover/SKILL.md`). The skill is named for
+   debranding but the underlying Codex `image_gen` tool also outpaints — write
+   the prompt to extend the background sideways into a square while preserving
+   the title text, byline, and central artwork. Square clean beats rectangular
+   clean.
+3. **Only branded hi-res exists** (typical for Audible exclusives) — fetch the
+   2400×2400 (or up to 3000×3000) master via the iTunes Lookup API
    (`https://itunes.apple.com/lookup?id=<APPLE_BOOKS_ID>&entity=audiobook`,
-   replace `100x100bb.jpg` in the artwork URL with `3000x3000bb.jpg`), then run
-   the **`debrand-audiobook-cover`** skill (`.claude/skills/debrand-audiobook-cover/SKILL.md`)
-   to strip the branding via Codex's built-in `image_gen` tool.
+   replace `100x100bb.jpg` in the artwork URL with `3000x3000bb.jpg`), then
+   run the same skill to strip the branding.
 
-The m4b accepts any aspect ratio, so a clean rectangular print cover beats a
-branded square one if de-branding isn't an option.
+The m4b accepts any aspect ratio, so a clean rectangular cover still beats a
+branded square one if no Codex path is available — but with the skill on hand,
+square is almost always reachable.
 
 ## Requirements
 
