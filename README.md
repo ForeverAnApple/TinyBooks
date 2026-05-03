@@ -44,20 +44,47 @@ correctly in Apple Books, Plex, and friends.
 python3 make_m4b.py "raw/Blindsight" --output "processed/Blindsight.m4b"
 
 # Single mp3 + cue sheet (cue defines chapters; encodes in parallel):
-python3 make_m4b.py "raw/The Singularity Trap" \
+python3 make_m4b.py "raw/Singularity Trap" \
   --output "processed/Singularity Trap.m4b"
 
 # Single mp3, no cue (one big chapter, serial — slow):
+# Drop the loose mp3 in its own folder under raw/ first; the script
+# wants a directory.
 python3 make_m4b.py "raw/Accelerando" \
   --output "processed/Accelerando.m4b"
 ```
 
-Optional flags: `--title`, `--author`, `--cover <path>`, `--jobs <N>`.
+### Retag mode
+
+Pass an existing `.m4b` instead of a directory and the audio + chapters
+pass through via `-c copy`; only the format-level metadata + cover are
+rewritten. Useful for Audible AAX rips with messy tags or branded covers.
+
+```sh
+python3 make_m4b.py "raw/Excession/Culture Book 5 - Excession.m4b" \
+  --output "processed/Excession - Culture, Book 5.m4b" \
+  --title "Excession" --series Culture --series-part 5
+```
+
+Resolution order per field: explicit `--flag` > sidecar `.nfo` (KAZIN
+release-info format auto-detected) > tag baked into the input m4b >
+fallback.
+
+### Flags
+
+- `--title`, `--author`, `--narrator`, `--year`, `--genre`
+- `--description "..."` or `--description-file path/to/blurb.txt`
+- `--series <name>` + `--series-part <N>` — emits the de-facto MP4
+  audiobook-series triple (`album = "<title>: <series>, Book <N>"`,
+  `album_artist = <author>`, `grouping = "<series> #<N>"`) that
+  Audiobookshelf and most players read.
+- `--cover <path>` — sidecar image fallback if omitted.
+- `--jobs <N>` — parallel encoders (default: cpu count).
 
 ## Sample output
 
 ```
-📐 Layout: multi_file
+📐 Layout: multi-file (one chapter per mp3)
 📖 Chapters: 5
 🔎 Probing 5 file(s) (3 workers)...
    inputs uniform: 44100 Hz, 2 ch — matching source
@@ -75,11 +102,13 @@ Optional flags: `--title`, `--author`, `--cover <path>`, `--jobs <N>`.
 
 The single-file-no-cue case isn't parallelized on purpose. Splitting an
 mp3 mid-audio and concatenating the AAC outputs with `-c:a copy` injects
-~47 ms of silence per seam (AAC encoder priming — not fixable without
-re-encoding). Cue boundaries are usually placed at natural pauses where
-that imprecision is inaudible, but a midpoint split in the middle of a
-sentence is not. So when there's no cue, the script does one serial encode
-to keep the audio clean.
+encoder-priming silence at every seam — 2112 samples for AAC-LC, which
+is ~48 ms at 44.1 kHz but ~96 ms at 22 kHz (the sample rate Audible AAX
+rips actually use). Not fixable without re-encoding the seams. Cue
+boundaries land at natural pauses where that imprecision is inaudible,
+but a midpoint split in the middle of a sentence is not. So when
+there's no cue, the script does one serial encode to keep the audio
+clean.
 
 If you're regularly hitting this path on long books, the right fix is to
 generate a cue sheet (e.g. via silence detection) rather than to split

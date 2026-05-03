@@ -68,10 +68,10 @@ python3 make_m4b.py "raw/Dennis E. Taylor - The Singularity Trap.MP3" \
   --output "processed/Singularity Trap.m4b"
 
 # Single mp3, no cue (one big chapter, serial — slow):
-python3 make_m4b.py "raw/Charles Stross  -  Accelerando.mp3" \
-  --output "processed/Accelerando.m4b"
-# ^ won't work as written: the script wants a *directory*. For a loose mp3,
-#   put it in its own folder under raw/ first.
+# Loose mp3s won't work directly — the script wants a directory. Move
+# the file into its own folder first:
+mkdir -p "raw/Accelerando" && mv "raw/Charles Stross  -  Accelerando.mp3" "raw/Accelerando/"
+python3 make_m4b.py "raw/Accelerando" --output "processed/Accelerando.m4b"
 ```
 
 Optional flags: `--title`, `--author`, `--narrator`, `--year`, `--genre`,
@@ -216,10 +216,11 @@ The docstring at the top documents non-obvious correctness constraints —
 
 - `-ss`/`-to` go *before* `-i` (demuxer-level seek). Putting them after `-i`
   makes each parallel worker decode-and-discard up to its chapter start.
-- Mid-chapter splits with `-c:a copy` concat inject ~47 ms of silence per seam
-  (AAC encoder priming). The script only splits at cue boundaries for that
-  reason. Don't add a "just split the big mp3 in N pieces" parallel path for
-  the no-cue case.
+- Mid-chapter splits with `-c:a copy` concat inject encoder-priming silence
+  per seam (2112 samples for AAC-LC: ~48 ms at 44.1 kHz, ~96 ms at 22 kHz —
+  the rate AAX rips actually use). The script only splits at cue boundaries
+  for that reason. Don't add a "just split the big mp3 in N pieces" parallel
+  path for the no-cue case.
 - Chapter timestamps are built from the *encoded* durations, not source
   durations, because AAC priming shifts them.
 - The encode pass strips embedded art (`-vn`) on purpose so the final concat
