@@ -75,7 +75,42 @@ python3 make_m4b.py "raw/Charles Stross  -  Accelerando.mp3" \
 ```
 
 Optional flags: `--title`, `--author`, `--narrator`, `--year`, `--genre`,
-`--description`, `--description-file <path>`, `--cover <path>`, `--jobs <N>`.
+`--description`, `--description-file <path>`, `--cover <path>`,
+`--series <name>`, `--series-part <N>`, `--jobs <N>`.
+
+### Retag mode (existing m4b → new metadata + cover)
+
+If the input path is a `.m4b` file rather than a directory, `make_m4b.py`
+runs in **retag mode**: it remuxes the existing audio + chapters via
+`-c copy` and rewrites only the format-level metadata + cover. Use this for
+Audible AAX rips that already ship as m4b but with wrong year, branded cover,
+or messy album text.
+
+```sh
+python3 make_m4b.py "raw/05 Excession/Culture Book 5 - Excession.m4b" \
+  --output "processed/Excession - Culture, Book 5.m4b" \
+  --title "Excession" --series Culture --series-part 5
+```
+
+Resolution order per field: explicit `--flag` > sidecar `.nfo` > tag already
+baked into the input m4b > fallback. Useful side tags like `album_artist`,
+`grouping`, `track` are preserved by the merge unless overridden by series
+flags.
+
+### Series convention
+
+When `--series` and `--series-part` are both set, the script emits the
+existing processed/ pattern (matches the Bobiverse files):
+
+| Tag            | Value                              |
+| -------------- | ---------------------------------- |
+| `album`        | `<Title>: <Series>, Book <N>`      |
+| `grouping`     | `<Series> #<N>`                    |
+| `album_artist` | `<Author>` (forced clean)          |
+
+This is how Audiobookshelf and most player apps derive series + position
+from MP4 audiobooks (no standard MP4 atom for "series" exists, so the
+album/grouping convention is the de-facto carrier).
 
 Cover art priority: `--cover` > sidecar image in source dir
 (`cover.*`/`folder.*`/`front.*` or the largest `.jpg`/`.png`/`.webp`) >

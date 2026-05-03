@@ -4,7 +4,15 @@ make_m4b.py — build an m4b audiobook from a directory of source audio.
 
 USAGE
 -----
-    python3 make_m4b.py <directory> [--output X] [--cover Y] [--title T] [--author A] [--jobs N]
+    python3 make_m4b.py <directory>   [--output X] [--cover Y] [--title T] [--author A] [--jobs N]
+    python3 make_m4b.py <existing.m4b> [--output X] [--cover Y] [--title T] ...   # retag mode
+
+When the input path is a `.m4b` file rather than a directory, the script
+runs in **retag mode**: it remuxes the existing audio + chapters via
+`-c copy` and rewrites only the format-level metadata + cover art. Useful
+for Audible AAX rips that already ship as m4b but with inconsistent or
+branded metadata. See `retag()` for the priority chain
+(flag > sidecar nfo > existing m4b tag > fallback).
 
 Auto-detects three source layouts (heuristic, no flag needed):
 
@@ -157,6 +165,25 @@ def probe_stream(file_path):
         raise RuntimeError(f"Invalid duration for {file_path}: {duration}")
 
     return duration, sample_rate, channels, bit_rate
+
+
+def probe_format_tags(file_path) -> dict:
+    """Return the format-level tag dict for `file_path` (e.g. an existing m4b).
+    Used by retag mode so missing flags fall back to baked-in tags rather
+    than blanking them. Empty dict if the file has no tags or ffprobe fails."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format_tags",
+        "-of", "json",
+        str(file_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return {}
+    try:
+        return json.loads(result.stdout).get("format", {}).get("tags", {}) or {}
+    except json.JSONDecodeError:
+        return {}
 
 
 def format_hms(seconds: float) -> str:
@@ -545,9 +572,198 @@ def build_metadata(title, author, chapters, enc_durations, *,
     return "\n".join(lines)
 
 
+# Keys we never want to carry over from an input m4b's format tags. The
+# `major_brand` / `minor_version` / `compatible_brands` triple is muxer-set
+# (ffmpeg's ipod muxer rewrites them on output anyway, and stale `isom`
+# brands here can confuse strict players). `encoder` is informational,
+# `creation_time` is set fresh by the muxer, and the `handler_name` /
+# `vendor_id` / `language` keys belong to the audio stream, not the format.
+RETAG_DROP_TAGS = {
+    "major_brand", "minor_version", "compatible_brands",
+    "encoder", "creation_time",
+    "handler_name", "vendor_id", "language",
+}
+
+
+def retag(src: Path, args):
+    """Retag mode: rewrite format-level metadata + cover on an existing m4b
+    without re-encoding the audio. Audio + chapters pass through via
+    `-c copy` / `-map_chapters 0`.
+
+    Resolution order for each metadata field (first non-empty wins):
+      1. explicit --flag
+      2. sidecar .nfo in the m4b's parent directory (KAZIN-style)
+      3. tag already baked into the input m4b (read via ffprobe)
+      4. fallback (src.stem for title, "Unknown Author" for author, else
+         omitted)
+
+    Cover priority:
+      1. --cover <path>
+      2. sidecar image in the parent directory
+      3. existing embedded art on the input m4b (extracted and re-attached
+         as `attached_pic` so the disposition is correct)
+
+    Tags from the input m4b that we DON'T have a resolution for are passed
+    through verbatim — this keeps useful side metadata like `album_artist`,
+    `grouping`, and `track` from KAZIN rips intact instead of accidentally
+    blanking them.
+    """
+    parent = src.parent
+    nfo_path = find_nfo(parent) if parent.is_dir() else None
+    nfo = parse_nfo(nfo_path) if nfo_path else {}
+    if nfo_path:
+        print(f"📝 Found nfo: {nfo_path.name}")
+
+    existing = probe_format_tags(src)
+
+    output_file = args.output if args.output else f"{src.stem}.m4b"
+    title = args.title or nfo.get("title") or existing.get("title") or src.stem
+    author = args.author or nfo.get("author") or existing.get("artist") or "Unknown Author"
+    narrator = args.narrator or nfo.get("narrator") or existing.get("composer")
+    year = args.year or nfo.get("year") or existing.get("date")
+    genre = args.genre or nfo.get("genre") or existing.get("genre")
+    if args.description_file:
+        description = Path(args.description_file).expanduser().read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+    else:
+        description = args.description or nfo.get("description") or existing.get("description")
+    # Comment is reserved for archival nfo dumps (per AGENTS.md). When there
+    # is no nfo, leave it empty rather than carrying forward whatever the
+    # input m4b had — KAZIN-style rips often store a truncated copy of
+    # `description` here, which would just be stale once we rewrite desc.
+    comment = nfo.get("raw")
+    cover_art = Path(args.cover).expanduser().resolve() if args.cover else None
+
+    print("📐 Mode: retag (existing m4b)")
+    print("📝 Metadata:")
+    for label, value in (
+        ("title", title), ("author", author), ("narrator", narrator),
+        ("year", year), ("genre", genre),
+        ("description", f"{len(description)} chars" if description else None),
+    ):
+        print(f"   {label:<12}{value if value else '(missing)'}")
+
+    if cover_art and not cover_art.exists():
+        print(f"⚠️ Cover art not found: {cover_art}. Proceeding without it.")
+        cover_art = None
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="make_m4b_retag_"))
+    try:
+        # Cover priority: --cover > sidecar in parent > extracted embedded.
+        if cover_art is None and parent.is_dir():
+            sidecar = find_sidecar_cover(parent)
+            if sidecar is not None:
+                cover_art = sidecar
+                print(f"🖼  Using sidecar cover: {sidecar.name}")
+        if cover_art is None:
+            extracted = extract_embedded_art(src, tmpdir / "embedded_cover.jpg")
+            if extracted is not None:
+                cover_art = extracted
+                print(f"🖼  Using embedded cover from {src.name}")
+
+        # Series convention (matches existing processed/ Bobiverse files): when
+        # both --series and --series-part are set, album becomes
+        # "<Title>: <Series>, Book <N>", grouping becomes "<Series> #<N>",
+        # and album_artist becomes the bare author. When series flags are
+        # absent, album falls back to title and album_artist/grouping are
+        # preserved from existing tags by the merge below.
+        if args.series and args.series_part:
+            album_value = f"{title}: {args.series}, Book {args.series_part}"
+        else:
+            album_value = title
+
+        # Merge: existing tags as the baseline, our resolved values override.
+        # Always force album = computed value (existing albums tend to be
+        # messy: "Culture Book 4 ", "01 Consider Phlebas", etc.).
+        merged = {k: v for k, v in existing.items() if k.lower() not in RETAG_DROP_TAGS}
+        # Comment is only set when we have an nfo — drop any pre-existing
+        # value so the "stale truncated description" pattern doesn't survive.
+        merged.pop("comment", None)
+        merged["title"] = title
+        merged["artist"] = author
+        merged["album"] = album_value
+        merged["media_type"] = "2"
+        # Normalize track to "1/1" — an m4b is one audio track of one. Some MP4
+        # series parsers (incl. parts of Audiobookshelf's heuristic chain) treat
+        # a missing track count as an incomplete file and skip series detection.
+        merged["track"] = "1/1"
+        if args.series and args.series_part:
+            merged["album_artist"] = author
+            merged["grouping"] = f"{args.series} #{args.series_part}"
+        if narrator:
+            merged["composer"] = narrator
+        if year:
+            merged["date"] = year
+        if genre:
+            merged["genre"] = genre
+        if description:
+            merged["description"] = description
+        if comment:
+            merged["comment"] = comment
+
+        lines = [";FFMETADATA1"]
+        for k, v in merged.items():
+            v_str = str(v)
+            if "\n" in v_str or "\r" in v_str:
+                lines.append(f"{k}={ffmetadata_escape_multiline(v_str)}")
+            else:
+                lines.append(f"{k}={ffmetadata_escape(v_str)}")
+        metadata_path = tmpdir / "metadata.txt"
+        metadata_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # Mux: audio + chapters from input via copy; metadata from our
+        # FFMETADATA file; cover from disk (re-attached as attached_pic so
+        # the disposition flag survives even when the source had embedded
+        # art with the wrong disposition).
+        cmd = [
+            "ffmpeg", "-y", "-v", "error", "-nostats",
+            "-i", str(src),
+            "-f", "ffmetadata", "-i", str(metadata_path),
+        ]
+        cover_idx = None
+        if cover_art:
+            cmd.extend(["-i", str(cover_art)])
+            cover_idx = 2
+
+        cmd.extend(["-map", "0:a:0"])
+        if cover_idx is not None:
+            cmd.extend(["-map", f"{cover_idx}:v:0", "-disposition:v:0", "attached_pic"])
+
+        cmd.extend([
+            "-map_metadata", "1",
+            "-map_chapters", "0",
+            "-c:a", "copy",
+        ])
+        if cover_idx is not None:
+            cmd.extend(["-c:v", "mjpeg"])
+
+        cmd.extend([
+            "-movflags", "+faststart",
+            "-f", "ipod",
+            output_file,
+        ])
+
+        print(f"🎬 Remuxing: {title}...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"✅ Success! Created: {output_file}")
+        else:
+            print(f"❌ FFmpeg Error:\n{result.stderr}")
+            raise SystemExit(result.returncode)
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Create an m4b audiobook from a directory of mp3 files.")
-    parser.add_argument("directory", help="Directory containing the mp3 files")
+    parser = argparse.ArgumentParser(
+        description="Create an m4b audiobook from a directory of mp3 files, "
+                    "or retag an existing .m4b file in place.",
+    )
+    parser.add_argument("directory",
+                        help="Directory of source audio (encode mode) "
+                             "or path to an existing .m4b file (retag mode)")
     parser.add_argument("--output", help="Output filename (default: folder_name.m4b)")
     parser.add_argument("--cover", help="Path to cover art image")
     parser.add_argument("--title", help="Book title")
@@ -555,6 +771,13 @@ def main():
     parser.add_argument("--narrator", help="Narrator (goes in MP4 composer field)")
     parser.add_argument("--year", help="Publication year (4 digits)")
     parser.add_argument("--genre", help="Genre")
+    parser.add_argument("--series",
+                        help='Series name (e.g. "Culture"). When combined with '
+                             '--series-part, populates album as "<Title>: <Series>, '
+                             'Book <N>" plus grouping "<Series> #<N>" — the convention '
+                             'Audiobookshelf and the existing processed/ files use.')
+    parser.add_argument("--series-part",
+                        help="Position in the series (e.g. 1, 2, 3). Use with --series.")
     parser.add_argument("--description",
                         help="Book blurb (single line; use --description-file for paragraphs)")
     parser.add_argument("--description-file",
@@ -564,9 +787,16 @@ def main():
 
     args = parser.parse_args()
 
-    directory = Path(args.directory).expanduser().resolve()
+    src_path = Path(args.directory).expanduser().resolve()
+    # Retag mode: input is an existing .m4b file. Skip the encode pipeline
+    # entirely and just remux audio + chapters with new format-level tags.
+    if src_path.is_file() and src_path.suffix.lower() == ".m4b":
+        retag(src_path, args)
+        return
+
+    directory = src_path
     if not directory.is_dir():
-        raise SystemExit(f"❌ Directory not found: {directory}")
+        raise SystemExit(f"❌ Directory or .m4b file not found: {directory}")
 
     # Pre-flag-resolution pass: pull what we can from a sidecar .nfo (KAZIN
     # release info etc). Explicit --flag values still win over nfo values,
