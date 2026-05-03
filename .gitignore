@@ -1,0 +1,17 @@
+# Audiobook source material and outputs — never commit these.
+# The repo only tracks the converter and its docs.
+raw/
+processed/
+
+# Third-party tool with its own git history.
+AudioBookConverter/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*~
