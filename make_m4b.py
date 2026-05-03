@@ -902,7 +902,12 @@ def main():
 
     # Layout detection drives the whole pipeline. See top-of-file docstring.
     layout, payload = detect_layout(directory)
-    print(f"📐 Layout: {layout}")
+    layout_labels = {
+        "multi_file": "multi-file (one chapter per mp3)",
+        "single_file_with_cue": "single mp3 + cue (parallel chapter splits)",
+        "single_file_no_cue": "single mp3, no cue (serial — slow)",
+    }
+    print(f"📐 Layout: {layout_labels.get(layout, layout)}")
 
     tmpdir = Path(tempfile.mkdtemp(prefix="make_m4b_"))
 
@@ -1029,12 +1034,14 @@ def main():
         start = time.monotonic()
 
         def _emit(force=False):
-            done_audio = sum(chapter_seconds.values())
+            with progress_lock:
+                done_audio = sum(chapter_seconds.values())
+                done_n = done_count[0]
             elapsed = time.monotonic() - start
             frac = done_audio / total_audio if total_audio > 0 else 1.0
             line = format_progress_line(
                 "encode", frac, done_audio, total_audio, elapsed,
-                count_done=done_count[0], count_total=len(chapters),
+                count_done=done_n, count_total=len(chapters),
             )
             printer.emit(line, force=force)
 
