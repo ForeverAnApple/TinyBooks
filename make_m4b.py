@@ -666,10 +666,11 @@ def retag(src: Path, args):
         ).strip()
     else:
         description = args.description or nfo.get("description") or existing.get("description")
-    # Comment is reserved for archival nfo dumps (per AGENTS.md). When there
-    # is no nfo, leave it empty rather than carrying forward whatever the
-    # input m4b had — KAZIN-style rips often store a truncated copy of
-    # `description` here, which would just be stale once we rewrite desc.
+    # Comment is reserved for archival nfo dumps (per AGENTS.md). With a
+    # fresh nfo we replace whatever was there (including the stale-truncated-
+    # description pattern KAZIN rips bake in). Without an nfo we leave
+    # existing.comment alone — a previous run may have archived an nfo and
+    # we don't want to wipe it on every retag.
     comment = nfo.get("raw")
     cover_art = Path(args.cover).expanduser().resolve() if args.cover else None
 
@@ -716,9 +717,12 @@ def retag(src: Path, args):
         # Always force album = computed value (existing albums tend to be
         # messy: "Culture Book 4 ", "01 Consider Phlebas", etc.).
         merged = {k: v for k, v in existing.items() if k.lower() not in RETAG_DROP_TAGS}
-        # Comment is only set when we have an nfo — drop any pre-existing
-        # value so the "stale truncated description" pattern doesn't survive.
-        merged.pop("comment", None)
+        # When we have a fresh nfo we drop the existing comment so the
+        # "stale truncated description" pattern from KAZIN rips doesn't
+        # survive into the rewrite. Without an nfo, leave existing.comment
+        # alone — a prior run may have archived one we don't want to wipe.
+        if comment:
+            merged.pop("comment", None)
         merged["title"] = title
         merged["artist"] = author
         merged["album"] = album_value
