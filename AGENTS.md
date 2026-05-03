@@ -242,3 +242,8 @@ The docstring at the top documents non-obvious correctness constraints —
   confirmation — the user may want to re-run with different settings.
 - Don't rename source directories to "tidy them up" unless asked — naming is
   load-bearing for the script's default title.
+- **Don't add `Co-Authored-By: Claude …` (or any AI-assistant) trailers to
+  commits in this repo.** Git authorship already records the human committer;
+  the trailer is noise and the user has to rewrite history to remove it.
+  Same applies to `🤖 Generated with [Claude Code]` blocks in commit
+  messages, PR bodies, or anywhere else.
