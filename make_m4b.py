@@ -299,6 +299,18 @@ def find_nfo(directory: Path):
     return nfos[0]
 
 
+# KAZIN nfos almost always store Title: as "<Series> Book <N> - <Real Title>"
+# (e.g. "Culture Book 5 - Excession"). Strip the prefix so the cleaned title
+# can be combined with --series/--series-part without producing an album like
+# "Culture Book 5 - Excession: Culture, Book 5". Conservative: only matches
+# the canonical "<Words> Book <digits> - " shape.
+KAZIN_TITLE_PREFIX = re.compile(r"^[A-Za-z][A-Za-z .'’]*\s+Book\s+\d+\s*[-–]\s*")
+
+
+def _strip_kazin_title_prefix(title: str) -> str:
+    return KAZIN_TITLE_PREFIX.sub("", title).strip()
+
+
 def parse_nfo(path: Path) -> dict:
     """Parse a release-info nfo (KAZIN-style 'key: value' table plus a
     'Book Description' block at the end). Returns a dict with keys:
@@ -306,12 +318,16 @@ def parse_nfo(path: Path) -> dict:
     Any field may be None if the nfo doesn't carry it. `raw` is the full file
     text; suitable for stuffing into the m4b `comment` atom for archival.
 
+    `title` is cleaned of the canonical KAZIN "<Series> Book <N> - " prefix;
+    when a clean is applied, the original is reported via the `title_raw`
+    key so the caller can print a notice.
+
     Tolerant by design: unknown formats just yield mostly-None — caller falls
     back to existing defaults."""
     text = path.read_text(encoding="utf-8", errors="replace")
 
     fields = {
-        "title": None, "author": None, "narrator": None,
+        "title": None, "title_raw": None, "author": None, "narrator": None,
         "publisher": None, "genre": None, "year": None,
         "description": None, "raw": text,
     }
@@ -335,6 +351,12 @@ def parse_nfo(path: Path) -> dict:
         target = keymap.get(key)
         if target and not fields[target]:
             fields[target] = val
+
+    if fields["title"]:
+        cleaned = _strip_kazin_title_prefix(fields["title"])
+        if cleaned and cleaned != fields["title"]:
+            fields["title_raw"] = fields["title"]
+            fields["title"] = cleaned
 
     # Year: prefer Original Publication (the work's year, not the audio rip
     # year). Fall back to the (P) year inside Copyright if present.
@@ -626,6 +648,9 @@ def retag(src: Path, args):
     nfo = parse_nfo(nfo_path) if nfo_path else {}
     if nfo_path:
         print(f"📝 Found nfo: {nfo_path.name}")
+        if nfo.get("title_raw"):
+            print(f"   cleaned title: {nfo['title_raw']!r} → {nfo['title']!r} "
+                  "(pass --title to override)")
 
     existing = probe_format_tags(src)
 
@@ -835,6 +860,9 @@ def main():
     nfo = parse_nfo(nfo_path) if nfo_path else {}
     if nfo_path:
         print(f"📝 Found nfo: {nfo_path.name}")
+        if nfo.get("title_raw"):
+            print(f"   cleaned title: {nfo['title_raw']!r} → {nfo['title']!r} "
+                  "(pass --title to override)")
 
     output_file = args.output if args.output else f"{directory.name}.m4b"
     title = args.title or nfo.get("title") or directory.name
