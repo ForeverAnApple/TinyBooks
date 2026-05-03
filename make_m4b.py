@@ -361,15 +361,19 @@ def parse_nfo(path: Path) -> dict:
 
 def find_sidecar_cover(directory: Path):
     """Look for a cover image in the source directory. Priority:
-    1. Conventional names: cover.{jpg,jpeg,png,webp}, folder.*, front.*
-    2. The single largest image file in the directory (if any)."""
+    1. Conventional names in order: cover, folder, front, albumart, artwork.
+    2. The single largest image file in the directory (if any).
+
+    The preferred-name walk is ordered so that a folder containing both
+    e.g. cover.jpg and front.png picks cover.jpg deterministically rather
+    than whichever the filesystem yields first."""
     files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
     if not files:
         return None
-    preferred = {"cover", "folder", "front", "albumart", "artwork"}
-    for p in files:
-        if p.stem.lower() in preferred:
-            return p
+    by_stem = {p.stem.lower(): p for p in files}
+    for name in ("cover", "folder", "front", "albumart", "artwork"):
+        if name in by_stem:
+            return by_stem[name]
     # Otherwise pick the largest — publishers often ship one big sidecar jpg.
     return max(files, key=lambda p: p.stat().st_size)
 
@@ -507,13 +511,6 @@ def encode_to_aac(job, on_progress=None):
     if proc.returncode != 0:
         raise RuntimeError(f"encode failed for {src} [{ss}..{to}]:\n{''.join(err_chunks)}")
     return dst
-
-
-def find_audio_files(directory: Path):
-    return sorted(
-        [path for path in directory.iterdir() if path.is_file() and path.suffix.lower() == ".mp3"],
-        key=natural_sort_key,
-    )
 
 
 def build_metadata(title, author, chapters, enc_durations, *,
