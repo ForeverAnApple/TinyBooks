@@ -60,6 +60,19 @@ Cover art priority: `--cover` > sidecar image in source dir
 (`cover.*`/`folder.*`/`front.*` or the largest `.jpg`/`.png`/`.webp`) >
 embedded ID3 art on the first audio file.
 
+### Sourcing cover art
+
+If the source dir's sidecar is small/low-res (or missing), fetch a high-quality
+square cover from the web and save it as `cover.jpg` in the source dir before
+encoding. Target ≥1500×1500.
+
+**Never use a cover with retailer/storefront branding** — no "Audible Original"
+banners, "Only from Audible" corner ribbons, "Apple Books" overlays, etc.
+Prefer the publisher/author cover. The iTunes Lookup API
+(`https://itunes.apple.com/lookup?id=<id>&entity=audiobook`) often returns the
+Audible-branded version on its mzstatic CDN — usable only if the art is clean,
+otherwise keep looking (Goodreads, publisher sites, the author's own page).
+
 ## Requirements
 
 - `ffmpeg` and `ffprobe` on PATH (the script shells out to both).
