@@ -62,16 +62,28 @@ embedded ID3 art on the first audio file.
 
 ### Sourcing cover art
 
-If the source dir's sidecar is small/low-res (or missing), fetch a high-quality
-square cover from the web and save it as `cover.jpg` in the source dir before
-encoding. Target ≥1500×1500.
+If the source dir's sidecar is small or missing, fetch a clean hi-res cover and
+save it as `cover.jpg` in the source dir before encoding. Goal: hi-res square
+art with no retailer branding.
 
-**Never use a cover with retailer/storefront branding** — no "Audible Original"
-banners, "Only from Audible" corner ribbons, "Apple Books" overlays, etc.
-Prefer the publisher/author cover. The iTunes Lookup API
-(`https://itunes.apple.com/lookup?id=<id>&entity=audiobook`) often returns the
-Audible-branded version on its mzstatic CDN — usable only if the art is clean,
-otherwise keep looking (Goodreads, publisher sites, the author's own page).
+**Never use a cover with retailer branding** — no "Audible Original" banners,
+"Only from Audible" corner ribbons, "AUDIOBOOK / MP3 AUDIO" frames, "Apple
+Books" overlays, etc.
+
+Two paths, depending on what's available:
+
+1. **Clean source exists** — try in order: publisher page, Amazon print/Kindle
+   ASIN (not the audio ASIN), OpenLibrary (`covers.openlibrary.org/b/isbn/<ISBN>-L.jpg`,
+   capped ~333×500), ISFDB wiki cover scans, artist's portfolio.
+2. **Only branded hi-res exists** (typical for Audible exclusives) — fetch the
+   2400×2400 master via the iTunes Lookup API
+   (`https://itunes.apple.com/lookup?id=<APPLE_BOOKS_ID>&entity=audiobook`,
+   replace `100x100bb.jpg` in the artwork URL with `3000x3000bb.jpg`), then run
+   the **`debrand-audiobook-cover`** skill (`.claude/skills/debrand-audiobook-cover/SKILL.md`)
+   to strip the branding via Codex's built-in `image_gen` tool.
+
+The m4b accepts any aspect ratio, so a clean rectangular print cover beats a
+branded square one if de-branding isn't an option.
 
 ## Requirements
 
