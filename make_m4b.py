@@ -4,7 +4,7 @@ make_m4b.py — build an m4b audiobook from a directory of source audio.
 
 USAGE
 -----
-    python3 make_m4b.py <directory>   [--output X] [--cover Y] [--title T] [--author A] [--jobs N]
+    python3 make_m4b.py <directory|mp3> [--output X] [--cover Y] [--title T] [--author A] [--jobs N]
     python3 make_m4b.py <existing.m4b> [--output X] [--cover Y] [--title T] ...   # retag mode
 
 When the input path is a `.m4b` file rather than a directory, the script
@@ -14,11 +14,14 @@ for Audible AAX rips that already ship as m4b but with inconsistent or
 branded metadata. See `retag()` for the priority chain
 (flag > sidecar nfo > existing m4b tag > fallback).
 
-Auto-detects three source layouts (heuristic, no flag needed):
+Auto-detects three source layouts (heuristic, no flag needed). Input may be
+a book directory or a direct loose `.mp3`:
 
-  1) MULTI-FILE          — N (≥2) .mp3 files in the directory. Each file becomes
-                           one chapter. Any .cue in the directory is IGNORED
-                           because the files already define chapter boundaries.
+  1) MULTI-FILE          — N (≥2) .mp3 files in the directory, or in nested
+                           disc subdirectories when there are no top-level
+                           mp3s. Each file becomes one chapter. Any .cue is
+                           IGNORED because the files already define chapter
+                           boundaries.
                            (Example: "We Are Legion" — 61 mp3s.)
 
   2) SINGLE-FILE + CUE   — exactly 1 .mp3 file accompanied by a .cue sheet.
@@ -67,6 +70,8 @@ CORRECTNESS NOTES
     index. `-f ipod` for canonical m4b muxer. `media_type=2` marks audiobook.
   - Chapter timestamps are built from *encoded* durations (not source) so
     they land exactly where the audio lands after concat.
+  - Final outputs are written to a temporary sibling file and atomically moved
+    into place only after ffmpeg succeeds. Existing outputs require --force.
 
 WHY NOT …
 ---------
@@ -100,7 +105,113 @@ NFO_EXT = ".nfo"
 
 
 def natural_sort_key(path: Path):
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
+    """Natural-sort a path by all path components, not just the basename.
+
+    Sorting by basename breaks nested disc rips because every directory has
+    "Track 01.mp3", "Track 02.mp3", etc. Including path parts keeps Disc 01
+    together before Disc 02 while still sorting numbers numerically.
+    """
+    key = []
+    for part in path.parts:
+        chunks = []
+        for chunk in re.split(r"(\d+)", part):
+            if not chunk:
+                continue
+            chunks.append((1, int(chunk)) if chunk.isdigit() else (0, chunk.lower()))
+        key.append(chunks)
+    return key
+
+
+def output_path_for(output_arg, default_name: str) -> Path:
+    return Path(output_arg).expanduser() if output_arg else Path(default_name)
+
+
+def validate_output_path(path: Path, *, force: bool):
+    parent = path.parent
+    if not parent.exists():
+        raise SystemExit(f"❌ Output directory does not exist: {parent}")
+    if not parent.is_dir():
+        raise SystemExit(f"❌ Output parent is not a directory: {parent}")
+    if path.exists() and not force:
+        raise SystemExit(f"❌ Output already exists: {path} (pass --force to replace it)")
+
+
+def make_temp_dir(prefix: str, output_path: Path, tmp_dir_arg=None) -> Path:
+    base = Path(tmp_dir_arg).expanduser() if tmp_dir_arg else output_path.parent
+    if not base.exists():
+        raise SystemExit(f"❌ Temp directory does not exist: {base}")
+    if not base.is_dir():
+        raise SystemExit(f"❌ Temp path is not a directory: {base}")
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(base)))
+
+
+def make_temp_output_path(output_path: Path) -> Path:
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=str(output_path.parent),
+    )
+    os.close(fd)
+    return Path(tmp_name)
+
+
+def install_temp_output(tmp_output: Path, output_path: Path):
+    os.replace(tmp_output, output_path)
+
+
+def metadata_missing(*, title, author, narrator, year, genre, description, cover_art):
+    missing = []
+    if not str(title or "").strip():
+        missing.append("title")
+    if not str(author or "").strip() or author == "Unknown Author":
+        missing.append("author")
+    if not str(narrator or "").strip():
+        missing.append("narrator")
+    if not str(year or "").strip():
+        missing.append("year")
+    if not str(genre or "").strip():
+        missing.append("genre")
+    if not str(description or "").strip():
+        missing.append("description")
+    if cover_art is None:
+        missing.append("cover art")
+    return missing
+
+
+def print_metadata_summary(*, title, author, narrator, year, genre, series_display,
+                           description, cover_art):
+    print("📝 Metadata:")
+    for label, value in (
+        ("title", title), ("author", author), ("narrator", narrator),
+        ("year", year), ("genre", genre), ("series", series_display),
+        ("description", f"{len(description)} chars" if description else None),
+        ("cover", cover_art.name if cover_art else None),
+    ):
+        print(f"   {label:<12}{value if value else '(missing)'}")
+
+
+def enforce_required_metadata(args, *, title, author, narrator, year, genre,
+                              description, cover_art):
+    missing = metadata_missing(
+        title=title,
+        author=author,
+        narrator=narrator,
+        year=year,
+        genre=genre,
+        description=description,
+        cover_art=cover_art,
+    )
+    if not missing:
+        return
+    msg = f"Missing required metadata: {', '.join(missing)}"
+    if args.allow_missing_metadata:
+        print(f"⚠️ {msg} — continuing because --allow-missing-metadata was set.")
+        return
+    raise SystemExit(
+        f"❌ {msg}\n"
+        "   Add flags/sidecars before encoding, or pass --allow-missing-metadata "
+        "for a scratch/test build."
+    )
 
 
 def ffconcat_escape(path) -> str:
@@ -389,7 +500,10 @@ def find_sidecar_cover(directory: Path):
     The preferred-name walk is ordered so that a folder containing both
     e.g. cover.jpg and front.png picks cover.jpg deterministically rather
     than whichever the filesystem yields first."""
-    files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    files = sorted(
+        [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
+        key=natural_sort_key,
+    )
     if not files:
         return None
     by_stem = {p.stem.lower(): p for p in files}
@@ -400,23 +514,87 @@ def find_sidecar_cover(directory: Path):
     return max(files, key=lambda p: p.stat().st_size)
 
 
-def detect_layout(directory: Path):
-    """Classify the source directory. Returns (layout, payload) where layout is
-    one of 'multi_file', 'single_file_with_cue', 'single_file_no_cue'."""
-    audio_files = sorted(
+def find_sidecar_cover_for_audio(audio: Path):
+    """Cover lookup for a direct loose-mp3 input.
+
+    Avoid picking a random `cover.jpg` from a busy parent directory. Same-stem
+    art is always safe; conventional names are only used when the parent holds
+    exactly one top-level source audio file.
+    """
+    parent = audio.parent
+    images = sorted(
+        [p for p in parent.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
+        key=natural_sort_key,
+    )
+    same_stem = [p for p in images if p.stem.lower() == audio.stem.lower()]
+    if same_stem:
+        return same_stem[0]
+    audio_siblings = [
+        p for p in parent.iterdir()
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+    ]
+    if len(audio_siblings) == 1:
+        return find_sidecar_cover(parent)
+    return None
+
+
+def find_cue_for_audio(audio: Path, root: Path):
+    cue_dirs = []
+    for directory in (audio.parent, root):
+        if directory not in cue_dirs:
+            cue_dirs.append(directory)
+    cue_files = sorted(
+        [
+            p
+            for directory in cue_dirs
+            for p in directory.iterdir()
+            if p.is_file() and p.suffix.lower() == ".cue"
+        ],
+        key=natural_sort_key,
+    )
+    if not cue_files:
+        return None
+    return next(
+        (c for c in cue_files if c.stem == audio.stem or c.stem == audio.name),
+        cue_files[0],
+    )
+
+
+def find_audio_files(directory: Path):
+    top_level = sorted(
         [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS],
         key=natural_sort_key,
     )
-    cue_files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".cue"]
+    if top_level:
+        return top_level
+    return sorted(
+        [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTS],
+        key=lambda p: natural_sort_key(p.relative_to(directory)),
+    )
+
+
+def detect_layout(source: Path):
+    """Classify the source. Returns (layout, payload) where layout is one of
+    'multi_file', 'single_file_with_cue', 'single_file_no_cue'.
+
+    `source` may be a book directory or a direct loose mp3 path.
+    """
+    if source.is_file() and source.suffix.lower() in AUDIO_EXTS:
+        cue = find_cue_for_audio(source, source.parent)
+        if cue:
+            return "single_file_with_cue", (source, cue)
+        return "single_file_no_cue", source
+
+    directory = source
+    audio_files = find_audio_files(directory)
     if len(audio_files) >= 2:
         return "multi_file", audio_files
-    if len(audio_files) == 1 and cue_files:
-        # If multiple cues exist, prefer one whose stem matches the audio file.
-        audio = audio_files[0]
-        cue = next((c for c in cue_files if c.stem == audio.stem or c.stem == audio.name), cue_files[0])
-        return "single_file_with_cue", (audio, cue)
     if len(audio_files) == 1:
-        return "single_file_no_cue", audio_files[0]
+        audio = audio_files[0]
+        cue = find_cue_for_audio(audio, directory)
+        if cue:
+            return "single_file_with_cue", (audio, cue)
+        return "single_file_no_cue", audio
     raise SystemExit(f"❌ No supported audio files found in {directory}")
 
 
@@ -425,7 +603,16 @@ def build_chapters(layout: str, payload, probe_fn):
     `probe_fn(path)` must return the file's duration in seconds (for cue end-clamping)."""
     if layout == "multi_file":
         files = payload
-        return [(f.stem, f, None, None) for f in files]
+        stem_counts = {}
+        for f in files:
+            stem_counts[f.stem] = stem_counts.get(f.stem, 0) + 1
+        chapters = []
+        for f in files:
+            title = f.stem
+            if stem_counts[f.stem] > 1 and f.parent.name:
+                title = f"{f.parent.name} - {f.stem}"
+            chapters.append((title, f, None, None))
+        return chapters
 
     if layout == "single_file_no_cue":
         source = payload
@@ -654,7 +841,8 @@ def retag(src: Path, args):
 
     existing = probe_format_tags(src)
 
-    output_file = args.output if args.output else f"{src.stem}.m4b"
+    output_path = output_path_for(args.output, f"{src.stem}.m4b")
+    validate_output_path(output_path, force=args.force)
     title = args.title or nfo.get("title") or existing.get("title") or src.stem
     author = args.author or nfo.get("author") or existing.get("artist") or "Unknown Author"
     narrator = args.narrator or nfo.get("narrator") or existing.get("composer")
@@ -679,16 +867,9 @@ def retag(src: Path, args):
         if args.series and args.series_part else None
     )
     print("📐 Mode: retag (existing m4b)")
-    print("📝 Metadata:")
-    for label, value in (
-        ("title", title), ("author", author), ("narrator", narrator),
-        ("year", year), ("genre", genre),
-        ("series", series_display),
-        ("description", f"{len(description)} chars" if description else None),
-    ):
-        print(f"   {label:<12}{value if value else '(missing)'}")
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="make_m4b_retag_"))
+    tmpdir = make_temp_dir("make_m4b_retag_", output_path, args.tmp_dir)
+    tmp_output = make_temp_output_path(output_path)
     try:
         # Cover priority: --cover > sidecar in parent > extracted embedded.
         if cover_art is None and parent.is_dir():
@@ -701,6 +882,27 @@ def retag(src: Path, args):
             if extracted is not None:
                 cover_art = extracted
                 print(f"🖼  Using embedded cover from {src.name}")
+
+        print_metadata_summary(
+            title=title,
+            author=author,
+            narrator=narrator,
+            year=year,
+            genre=genre,
+            series_display=series_display,
+            description=description,
+            cover_art=cover_art,
+        )
+        enforce_required_metadata(
+            args,
+            title=title,
+            author=author,
+            narrator=narrator,
+            year=year,
+            genre=genre,
+            description=description,
+            cover_art=cover_art,
+        )
 
         # Series convention (matches existing processed/ Bobiverse files): when
         # both --series and --series-part are set, album becomes
@@ -784,18 +986,22 @@ def retag(src: Path, args):
         cmd.extend([
             "-movflags", "+faststart",
             "-f", "ipod",
-            output_file,
+            str(tmp_output),
         ])
 
         print(f"🎬 Remuxing: {title}...")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            print(f"✅ Success! Created: {output_file}")
+            install_temp_output(tmp_output, output_path)
+            tmp_output = None
+            print(f"✅ Success! Created: {output_path}")
         else:
             print(f"❌ FFmpeg Error:\n{result.stderr}")
             raise SystemExit(result.returncode)
 
     finally:
+        if tmp_output is not None:
+            tmp_output.unlink(missing_ok=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -805,8 +1011,9 @@ def main():
                     "or retag an existing .m4b file in place.",
     )
     parser.add_argument("directory",
-                        help="Directory of source audio (encode mode) "
-                             "or path to an existing .m4b file (retag mode)")
+                        help="Directory of source audio, path to a single .mp3 "
+                             "(encode mode), or path to an existing .m4b file "
+                             "(retag mode)")
     parser.add_argument("--output", help="Output filename (default: folder_name.m4b)")
     parser.add_argument("--cover", help="Path to cover art image")
     parser.add_argument("--title", help="Book title")
@@ -827,6 +1034,12 @@ def main():
                         help="Path to a text file containing the book blurb (paragraphs preserved)")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4,
                         help="Parallel encode workers (default: cpu count)")
+    parser.add_argument("--tmp-dir",
+                        help="Directory for temporary encoded chapters (default: output directory)")
+    parser.add_argument("--force", action="store_true",
+                        help="Replace an existing output file")
+    parser.add_argument("--allow-missing-metadata", action="store_true",
+                        help="Allow scratch/test builds with missing required metadata")
 
     args = parser.parse_args()
 
@@ -845,6 +1058,8 @@ def main():
             raise SystemExit(f"❌ --cover not found: {cover_path}")
     if bool(args.series) != bool(args.series_part):
         raise SystemExit("❌ --series and --series-part must be set together")
+    if args.jobs < 1:
+        raise SystemExit(f"❌ --jobs must be >= 1 (got {args.jobs})")
 
     src_path = Path(args.directory).expanduser().resolve()
     # Retag mode: input is an existing .m4b file. Skip the encode pipeline
@@ -853,14 +1068,25 @@ def main():
         retag(src_path, args)
         return
 
-    directory = src_path
-    if not directory.is_dir():
-        raise SystemExit(f"❌ Directory or .m4b file not found: {directory}")
+    if src_path.is_file() and src_path.suffix.lower() in AUDIO_EXTS:
+        source_input = src_path
+        metadata_dir = src_path.parent
+        default_title = src_path.stem
+        default_output_name = f"{src_path.stem}.m4b"
+        direct_audio_input = True
+    elif src_path.is_dir():
+        source_input = src_path
+        metadata_dir = src_path
+        default_title = src_path.name
+        default_output_name = f"{src_path.name}.m4b"
+        direct_audio_input = False
+    else:
+        raise SystemExit(f"❌ Directory, .mp3 file, or .m4b file not found: {src_path}")
 
     # Pre-flag-resolution pass: pull what we can from a sidecar .nfo (KAZIN
     # release info etc). Explicit --flag values still win over nfo values,
     # which still win over directory-name / "Unknown Author" fallbacks.
-    nfo_path = find_nfo(directory)
+    nfo_path = find_nfo(metadata_dir)
     nfo = parse_nfo(nfo_path) if nfo_path else {}
     if nfo_path:
         print(f"📝 Found nfo: {nfo_path.name}")
@@ -868,8 +1094,9 @@ def main():
             print(f"   cleaned title: {nfo['title_raw']!r} → {nfo['title']!r} "
                   "(pass --title to override)")
 
-    output_file = args.output if args.output else f"{directory.name}.m4b"
-    title = args.title or nfo.get("title") or directory.name
+    output_path = output_path_for(args.output, default_output_name)
+    validate_output_path(output_path, force=args.force)
+    title = args.title or nfo.get("title") or default_title
     author = args.author or nfo.get("author") or "Unknown Author"
     narrator = args.narrator or nfo.get("narrator")
     year = args.year or nfo.get("year")
@@ -889,19 +1116,8 @@ def main():
         f"{args.series}, Book {args.series_part}"
         if args.series and args.series_part else None
     )
-    # Visibility: surface what metadata will land in the m4b. Anything labelled
-    # "(missing)" should be filled before processing — see AGENTS.md.
-    print("📝 Metadata:")
-    for label, value in (
-        ("title", title), ("author", author), ("narrator", narrator),
-        ("year", year), ("genre", genre),
-        ("series", series_display),
-        ("description", f"{len(description)} chars" if description else None),
-    ):
-        print(f"   {label:<12}{value if value else '(missing)'}")
-
     # Layout detection drives the whole pipeline. See top-of-file docstring.
-    layout, payload = detect_layout(directory)
+    layout, payload = detect_layout(source_input)
     layout_labels = {
         "multi_file": "multi-file (one chapter per mp3)",
         "single_file_with_cue": "single mp3 + cue (parallel chapter splits)",
@@ -909,12 +1125,16 @@ def main():
     }
     print(f"📐 Layout: {layout_labels.get(layout, layout)}")
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="make_m4b_"))
+    tmpdir = make_temp_dir("make_m4b_", output_path, args.tmp_dir)
+    tmp_output = make_temp_output_path(output_path)
 
     try:
         # Cover priority: --cover > sidecar image > embedded art.
         if cover_art is None:
-            sidecar = find_sidecar_cover(directory)
+            sidecar = (
+                find_sidecar_cover_for_audio(source_input)
+                if direct_audio_input else find_sidecar_cover(metadata_dir)
+            )
             if sidecar is not None:
                 cover_art = sidecar
                 print(f"🖼  Using sidecar cover: {sidecar.name}")
@@ -950,6 +1170,27 @@ def main():
             if extracted is not None:
                 cover_art = extracted
                 print(f"🖼  Using embedded cover art from {first_src.name}")
+
+        print_metadata_summary(
+            title=title,
+            author=author,
+            narrator=narrator,
+            year=year,
+            genre=genre,
+            series_display=series_display,
+            description=description,
+            cover_art=cover_art,
+        )
+        enforce_required_metadata(
+            args,
+            title=title,
+            author=author,
+            narrator=narrator,
+            year=year,
+            genre=genre,
+            description=description,
+            cover_art=cover_art,
+        )
 
         # Probe unique sources (for multi_file that's all files; for single-file
         # layouts that's the one big mp3 we already probed).
@@ -1129,7 +1370,7 @@ def main():
             "-movflags", "+faststart",
             "-f", "ipod",
             "-progress", "pipe:1",
-            output_file,
+            str(tmp_output),
         ])
 
         print(f"🎬 Muxing: {title}...")
@@ -1176,12 +1417,16 @@ def main():
         mux_printer.newline()
 
         if proc.returncode == 0:
-            print(f"✅ Success! Created: {output_file}")
+            install_temp_output(tmp_output, output_path)
+            tmp_output = None
+            print(f"✅ Success! Created: {output_path}")
         else:
             print(f"❌ FFmpeg Error:\n{''.join(err_chunks)}")
             raise SystemExit(proc.returncode)
 
     finally:
+        if tmp_output is not None:
+            tmp_output.unlink(missing_ok=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

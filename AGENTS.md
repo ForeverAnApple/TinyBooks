@@ -20,12 +20,16 @@ A staging area for converting audiobook source material into m4b files using
 
 ## Conventions
 
-- **New source material** (mp3 directory, single mp3 + cue, lone mp3) goes in
-  `raw/<Book Name>/` (or `raw/<Book>.mp3` for a single loose file).
+- **New source material** (mp3 directory, nested disc folders, single mp3 + cue,
+  lone mp3) goes in `raw/<Book Name>/` or as `raw/<Book>.mp3` for a single
+  loose file. `make_m4b.py` accepts both directory and direct `.mp3` inputs.
 - **Finished m4b output** belongs in `processed/`. `make_m4b.py` does not move
   files there automatically — its `--output` defaults to `<dir_name>.m4b` in
   the *current* working directory, so either `cd processed/` first or pass
   `--output processed/<name>.m4b`.
+- Existing output files are protected by default. Pass `--force` only when you
+  intentionally want to replace the target; the script writes to a temporary
+  sibling and moves it into place after ffmpeg succeeds.
 - Some `raw/` book folders also contain a finished `.m4b` (sometimes shipped
   with the torrent, sometimes from a previous run). That's fine — leave them
   in place; only loose root-level outputs from `make_m4b.py` get moved to
@@ -59,6 +63,11 @@ Rules:
 `make_m4b.py` auto-detects three source layouts (no flag needed) — see its
 top-of-file docstring for the full rationale. Quick reference:
 
+These examples show source/output shape. New files for `processed/` also need
+complete metadata from a sidecar `.nfo` or explicit flags; the script refuses
+missing required fields unless `--allow-missing-metadata` is passed for a
+scratch/test build.
+
 ```sh
 # Multi-file (N mp3s, each becomes a chapter):
 python3 make_m4b.py "raw/Blindsight" --output "processed/Blindsight.m4b"
@@ -68,15 +77,14 @@ python3 make_m4b.py "raw/Dennis E. Taylor - The Singularity Trap.MP3" \
   --output "processed/Singularity Trap.m4b"
 
 # Single mp3, no cue (one big chapter, serial — slow):
-# Loose mp3s won't work directly — the script wants a directory. Move
-# the file into its own folder first:
-mkdir -p "raw/Accelerando" && mv "raw/Charles Stross  -  Accelerando.mp3" "raw/Accelerando/"
-python3 make_m4b.py "raw/Accelerando" --output "processed/Accelerando.m4b"
+python3 make_m4b.py "raw/Charles Stross  -  Accelerando.mp3" \
+  --output "processed/Accelerando.m4b"
 ```
 
 Optional flags: `--title`, `--author`, `--narrator`, `--year`, `--genre`,
 `--description`, `--description-file <path>`, `--cover <path>`,
-`--series <name>`, `--series-part <N>`, `--jobs <N>`.
+`--series <name>`, `--series-part <N>`, `--jobs <N>`, `--tmp-dir <dir>`,
+`--force`, `--allow-missing-metadata`.
 
 ### Retag mode (existing m4b → new metadata + cover)
 
@@ -119,13 +127,12 @@ embedded ID3 art on the first audio file.
 ### Filling metadata before encoding
 
 **Every m4b in `processed/` must have a complete metadata set.** The script
-prints a `📝 Metadata:` block at startup listing each field; anything labelled
-`(missing)` should be filled before you run the encode for real. Bare-minimum
-(title + author from the directory name) is not acceptable for new builds —
-the goal is for Audiobookshelf to display a fully-populated entry from the
-embedded tags alone, with no manual cleanup after import.
+prints a `📝 Metadata:` block at startup listing each field and now refuses
+new builds with missing required fields unless `--allow-missing-metadata` is
+passed. Use that bypass only for scratch/test outputs, not for files destined
+for `processed/`.
 
-**Required fields** (the script will *let* you encode without them, but don't):
+**Required fields** (the script refuses production builds without them):
 
 - title, author, narrator, year, genre, description, cover art
 

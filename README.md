@@ -11,12 +11,13 @@ correctly in Apple Books, Plex, and friends.
 ## Features
 
 - **Three source layouts, one command** — auto-detected, no flag needed:
-  - **Multi-file** — N mp3s in a folder, each becomes a chapter.
+  - **Multi-file** — N mp3s in a folder, or nested disc folders, each file
+    becomes a chapter.
   - **Single mp3 + cue sheet** — chapter starts come from `INDEX 01`
     timestamps; each chapter is encoded in parallel via demuxer-level seek
     (`-ss` before `-i`), so a 12-hour book finishes in ~60 s on 16 cores.
-  - **Single mp3, no cue** — falls back to one big chapter (serial — see
-    "Why no parallel split here?" below).
+  - **Single mp3, no cue** — direct file or folder input, falls back to one
+    big chapter (serial — see "Why no parallel split here?" below).
 - **Parallel AAC encoding** scaled to your CPU count (`--jobs N` to override).
 - **Cover art** picked in priority order: `--cover` flag → sidecar image
   (`cover.*` / `folder.*` / `front.*` / largest jpeg) → embedded ID3 art
@@ -31,6 +32,9 @@ correctly in Apple Books, Plex, and friends.
   TTY mode does `\r`-overwrite at 5 Hz; non-TTY mode emits one self-contained
   line every couple of seconds — `tail -3` of a log gives you phase, audio
   done/total, elapsed, and ETA.
+- **Safe output writes** — final m4bs are written to a temporary sibling and
+  moved into place only after ffmpeg succeeds; existing outputs require
+  `--force`.
 
 ## Requirements
 
@@ -38,6 +42,11 @@ correctly in Apple Books, Plex, and friends.
 - Python 3 (standard library only — no `pip install` needed).
 
 ## Usage
+
+These examples show the input/output shape. Real `processed/` builds also need
+complete metadata from a sidecar `.nfo` or explicit flags; the tool refuses
+missing required fields unless `--allow-missing-metadata` is passed for a
+scratch/test build.
 
 ```sh
 # Multi-file (N mp3s, each becomes a chapter):
@@ -48,9 +57,7 @@ python3 make_m4b.py "raw/Singularity Trap" \
   --output "processed/Singularity Trap.m4b"
 
 # Single mp3, no cue (one big chapter, serial — slow):
-# Drop the loose mp3 in its own folder under raw/ first; the script
-# wants a directory.
-python3 make_m4b.py "raw/Accelerando" \
+python3 make_m4b.py "raw/Charles Stross  -  Accelerando.mp3" \
   --output "processed/Accelerando.m4b"
 ```
 
@@ -80,6 +87,11 @@ fallback.
   Audiobookshelf and most players read.
 - `--cover <path>` — sidecar image fallback if omitted.
 - `--jobs <N>` — parallel encoders (default: cpu count).
+- `--tmp-dir <dir>` — scratch space for encoded chapter files; defaults to
+  the output directory so large builds do not fill `/tmp`.
+- `--force` — replace an existing output file.
+- `--allow-missing-metadata` — scratch/test builds only; production outputs
+  should have title, author, narrator, year, genre, description, and cover.
 
 ## Sample output
 
@@ -139,3 +151,5 @@ in detail — read it before changing encode behavior. Highlights:
   durations, not source durations, because AAC priming shifts them.
 - The encode pass strips embedded art (`-vn`) so the final concat sees
   stream-compatible inputs; cover art is re-attached in the mux pass.
+- Final outputs are temp-written and atomically moved into place; don't bypass
+  that with direct writes to `processed/`.
