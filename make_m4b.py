@@ -518,7 +518,8 @@ def find_audio_files(directory: Path):
 
 def build_metadata(title, author, chapters, enc_durations, *,
                    narrator=None, genre=None, year=None,
-                   description=None, comment=None) -> str:
+                   description=None, comment=None,
+                   series=None, series_part=None) -> str:
     """chapters: list of (title, src, ss, to). enc_durations: matching list of
     measured post-encode durations in seconds — these are what actually ends
     up in the concatenated m4b, so chapter marks line up with the audio.
@@ -530,18 +531,33 @@ def build_metadata(title, author, chapters, enc_durations, *,
       description → desc (book blurb; what ABS displays)
       comment → ©cmt (we use this for the full nfo dump)
 
-    NOT included: publisher, series. ffmpeg's ipod muxer silently drops the
-    `publisher` FFMETADATA key (no standard atom mapping), and series has no
-    standard MP4 atom at all. Both should be set via the Audiobookshelf API
-    when that path lands."""
+    Series convention (when both series and series_part are set): album becomes
+    "<Title>: <Series>, Book <N>", album_artist is forced to <author>, and
+    grouping is "<Series> #<N>". This matches retag mode and the existing
+    processed/ files — no standard MP4 atom for "series" exists, so the
+    album/grouping/album_artist triple is the de-facto carrier ABS reads.
+    `track` is always set to "1/1": one m4b is one track of one, and some MP4
+    series parsers (incl. parts of ABS's heuristic chain) treat a missing
+    track count as an incomplete file and skip series detection.
+
+    NOT included: publisher. ffmpeg's ipod muxer silently drops the
+    `publisher` FFMETADATA key (no standard atom mapping). Set it via the
+    Audiobookshelf API after import if needed."""
+    has_series = bool(series and series_part)
+    album_value = f"{title}: {series}, Book {series_part}" if has_series else title
+
     current_time_ms = 0
     lines = [
         ";FFMETADATA1",
         f"title={ffmetadata_escape(title)}",
         f"artist={ffmetadata_escape(author)}",
-        f"album={ffmetadata_escape(title)}",
+        f"album={ffmetadata_escape(album_value)}",
         "media_type=2",
+        "track=1/1",
     ]
+    if has_series:
+        lines.append(f"album_artist={ffmetadata_escape(author)}")
+        lines.append(f"grouping={ffmetadata_escape(f'{series} #{series_part}')}")
     if narrator:
         lines.append(f"composer={ffmetadata_escape(narrator)}")
     if genre:
@@ -635,11 +651,16 @@ def retag(src: Path, args):
     comment = nfo.get("raw")
     cover_art = Path(args.cover).expanduser().resolve() if args.cover else None
 
+    series_display = (
+        f"{args.series}, Book {args.series_part}"
+        if args.series and args.series_part else None
+    )
     print("📐 Mode: retag (existing m4b)")
     print("📝 Metadata:")
     for label, value in (
         ("title", title), ("author", author), ("narrator", narrator),
         ("year", year), ("genre", genre),
+        ("series", series_display),
         ("description", f"{len(description)} chars" if description else None),
     ):
         print(f"   {label:<12}{value if value else '(missing)'}")
@@ -823,12 +844,17 @@ def main():
     comment = nfo.get("raw")
     cover_art = Path(args.cover).expanduser().resolve() if args.cover else None
 
+    series_display = (
+        f"{args.series}, Book {args.series_part}"
+        if args.series and args.series_part else None
+    )
     # Visibility: surface what metadata will land in the m4b. Anything labelled
     # "(missing)" should be filled before processing — see AGENTS.md.
     print("📝 Metadata:")
     for label, value in (
         ("title", title), ("author", author), ("narrator", narrator),
         ("year", year), ("genre", genre),
+        ("series", series_display),
         ("description", f"{len(description)} chars" if description else None),
     ):
         print(f"   {label:<12}{value if value else '(missing)'}")
@@ -1021,6 +1047,8 @@ def main():
                 year=year,
                 description=description,
                 comment=comment,
+                series=args.series,
+                series_part=args.series_part,
             ),
             encoding="utf-8",
         )
