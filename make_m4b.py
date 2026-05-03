@@ -665,10 +665,6 @@ def retag(src: Path, args):
     ):
         print(f"   {label:<12}{value if value else '(missing)'}")
 
-    if cover_art and not cover_art.exists():
-        print(f"⚠️ Cover art not found: {cover_art}. Proceeding without it.")
-        cover_art = None
-
     tmpdir = Path(tempfile.mkdtemp(prefix="make_m4b_retag_"))
     try:
         # Cover priority: --cover > sidecar in parent > extracted embedded.
@@ -808,6 +804,22 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate flag inputs up front so we fail before kicking off probe/encode
+    # work. Late failures (e.g. missing --description-file caught mid-pipeline)
+    # waste time and leave the user staring at a half-printed startup banner.
+    if args.year and not re.fullmatch(r"\d{4}", args.year):
+        raise SystemExit(f"❌ --year must be 4 digits (got {args.year!r})")
+    if args.description_file:
+        desc_path = Path(args.description_file).expanduser()
+        if not desc_path.is_file():
+            raise SystemExit(f"❌ --description-file not found: {desc_path}")
+    if args.cover:
+        cover_path = Path(args.cover).expanduser()
+        if not cover_path.is_file():
+            raise SystemExit(f"❌ --cover not found: {cover_path}")
+    if bool(args.series) != bool(args.series_part):
+        raise SystemExit("❌ --series and --series-part must be set together")
+
     src_path = Path(args.directory).expanduser().resolve()
     # Retag mode: input is an existing .m4b file. Skip the encode pipeline
     # entirely and just remux audio + chapters with new format-level tags.
@@ -858,10 +870,6 @@ def main():
         ("description", f"{len(description)} chars" if description else None),
     ):
         print(f"   {label:<12}{value if value else '(missing)'}")
-
-    if cover_art and not cover_art.exists():
-        print(f"⚠️ Cover art not found: {cover_art}. Proceeding without it.")
-        cover_art = None
 
     # Layout detection drives the whole pipeline. See top-of-file docstring.
     layout, payload = detect_layout(directory)
