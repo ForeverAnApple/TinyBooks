@@ -156,6 +156,12 @@ def make_temp_output_path(output_path: Path) -> Path:
 
 
 def install_temp_output(tmp_output: Path, output_path: Path):
+    # tempfile.mkstemp creates files at 0o600; restore the umask-derived
+    # default (typically 0o644) so the installed output matches what a normal
+    # `open(..., 'wb')` would have produced.
+    umask = os.umask(0)
+    os.umask(umask)
+    os.chmod(tmp_output, 0o666 & ~umask)
     os.replace(tmp_output, output_path)
 
 
