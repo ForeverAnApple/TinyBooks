@@ -207,6 +207,18 @@ Books" overlays, etc.
    replace `100x100bb.jpg` in the artwork URL with `3000x3000bb.jpg`), then
    run the same skill to strip the branding.
 
+**Codex invocation gotcha (read before retrying the skill).** When invoking
+`codex exec` for the debrand, do **not** pass the image with `-i input.jpg` —
+that puts Codex into "read my own imagegen SKILL.md" mode and it exits with
+code 0 having called no tools (reproduced four times across xhigh/medium/low
+reasoning). Instead omit `-i`, set `-c model_reasoning_effort=low`, and tell
+Codex in the prompt to call `view_image` on the absolute path itself. Also
+note: `image_gen` has no save-path argument — every generation lands in
+`$CODEX_HOME/generated_images/<session-id>/ig_*.png`, so the prompt must
+include an explicit shell step that locates the newest file there and
+`mv`/`ffmpeg` it to your target. Full template + gotchas list in
+`.claude/skills/debrand-audiobook-cover/SKILL.md`.
+
 The m4b accepts any aspect ratio, so a clean rectangular cover still beats a
 branded square one if no Codex path is available — but with the skill on hand,
 square is almost always reachable.
