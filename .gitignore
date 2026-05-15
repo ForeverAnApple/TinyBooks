@@ -15,3 +15,7 @@ __pycache__/
 .DS_Store
 *.swp
 *~
+
+# Local Nix flake — not part of the audiobook converter project
+flake.nix
+flake.lock
