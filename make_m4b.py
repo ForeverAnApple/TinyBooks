@@ -977,7 +977,7 @@ def retag(src: Path, args):
             cmd.extend(["-i", str(cover_art)])
             cover_idx = 2
 
-        cmd.extend(["-map", "0:a:0"])
+        cmd.extend(["-map", "0:a"])
         if cover_idx is not None:
             cmd.extend(["-map", f"{cover_idx}:v:0", "-disposition:v:0", "attached_pic"])
 
