@@ -963,6 +963,20 @@ def retag(src: Path, args):
         metadata_path = tmpdir / "metadata.txt"
         metadata_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+        # Pick the muxer based on source audio codec. `-f ipod` only accepts
+        # AAC / MP3 / ALAC; newer Audible "Full-Cast" releases ship E-AC-3
+        # (Dolby Atmos) which the ipod muxer rejects with
+        # "Could not find tag for codec eac3". Fall back to the generic mp4
+        # muxer in that case — audiobookness is carried by the media_type=2
+        # tag we already write, not the major_brand (existing -f ipod outputs
+        # are tagged M4A anyway, not M4B).
+        src_codec = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(src)],
+            capture_output=True, text=True,
+        ).stdout.strip().lower()
+        mux_format = "ipod" if src_codec in {"aac", "mp3", "alac"} else "mp4"
+
         # Mux: audio + chapters from input via copy; metadata from our
         # FFMETADATA file; cover from disk (re-attached as attached_pic so
         # the disposition flag survives even when the source had embedded
@@ -991,7 +1005,7 @@ def retag(src: Path, args):
 
         cmd.extend([
             "-movflags", "+faststart",
-            "-f", "ipod",
+            "-f", mux_format,
             str(tmp_output),
         ])
 
