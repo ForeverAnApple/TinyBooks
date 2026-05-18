@@ -10,7 +10,8 @@ A staging area for converting audiobook source material into m4b files using
 ├── make_m4b.py          # the converter — read its docstring before changing it
 ├── AGENTS.md            # this file
 ├── CLAUDE.md            # symlink → AGENTS.md
-├── processed/           # finished outputs: .m4b files with embedded covers + chapters
+├── processed/           # finished outputs: .m4b files (fragmented MP4) + sidecar
+│                        # <basename>.jpg cover next to each m4b
 ├── raw/                 # source material: per-book directories of mp3s, plus the
 │                        # occasional loose source mp3 (e.g. Accelerando)
 ├── AudioBookConverter/  # third-party tool (separate git repo). NOT used by
@@ -120,9 +121,19 @@ This is how Audiobookshelf and most player apps derive series + position
 from MP4 audiobooks (no standard MP4 atom for "series" exists, so the
 album/grouping convention is the de-facto carrier).
 
-Cover art priority: `--cover` > sidecar image in source dir
+Cover art priority for input: `--cover` > sidecar image in the source dir
 (`cover.*`/`folder.*`/`front.*` or the largest `.jpg`/`.png`/`.webp`) >
 embedded ID3 art on the first audio file.
+
+**Output**: cover is written as a sidecar `<basename>.jpg` adjacent to the
+m4b — *not* embedded into the m4b stream. Audiobookshelf reads sidecar
+JPEGs with matching basenames, so cover is visible to ABS/plappa without
+baking it into a video stream that breaks under `+frag_keyframe`. The
+muxer flags `+faststart+frag_keyframe -frag_duration 5000000` produce
+fragmented MP4 — required so iOS AVPlayer doesn't have to fetch a
+multi-MB sample-table moov before the first audio sample plays. See
+`make_m4b.py`'s top-of-file docstring under CORRECTNESS NOTES for the
+arithmetic on why this matters.
 
 ### Filling metadata before encoding
 

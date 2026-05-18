@@ -66,8 +66,21 @@ CORRECTNESS NOTES
     of 16 workers decode-and-discard up to their chapter start (very slow).
   - Mid-chapter splits inject ~47 ms silence + ~93 ms duration drift per seam
     with `-c:a copy` concat (AAC priming). Only split at cue boundaries.
-  - `-movflags +faststart` so players don't buffer the whole file to read the
-    index. `-f ipod` for canonical m4b muxer. `media_type=2` marks audiobook.
+  - `-movflags +faststart+frag_keyframe -frag_duration 5000000` — fragmented
+    MP4. The sample tables (stsz/stco/...) live in per-fragment moofs instead
+    of one giant initial moov. Without this, AAC-LC at 44.1 kHz produces ~43
+    frames/sec; for a 60-hour book that's ~9.3M entries × 4 bytes ≈ 37 MB of
+    stsz alone, and iOS AVPlayer must fetch + parse the whole moov before
+    the first sample can play. With fragmentation the initial moov stays
+    under ~10 KB regardless of duration, so iOS resume is instant.
+  - `-f ipod` for canonical m4b muxer. `media_type=2` marks audiobook.
+  - Cover art is written as a sidecar `<basename>.jpg` next to the m4b
+    rather than embedded as attached_pic. Reason: `-c:v copy` of an
+    attached_pic stream combined with `+frag_keyframe` produces an output
+    with an undecodable audio stream for inputs with truncated AAC
+    AudioSpecificConfig (extradata_size=2, common in Audible AAX rips).
+    Audiobookshelf reads <basename>.jpg adjacent to the m4b, so the cover
+    is still visible to ABS/plappa — the only consumer that matters here.
   - Chapter timestamps are built from *encoded* durations (not source) so
     they land exactly where the audio lands after concat.
   - Final outputs are written to a temporary sibling file and atomically moved
@@ -81,6 +94,8 @@ WHY NOT …
     supported by audiobook players (e.g., Apple Books). Not default.
   - mp4chaps / MP4Box post-injection: works but needs an external tool. We
     stick to ffmpeg alone.
+  - Embedded attached_pic cover: see the cover-sidecar note above. Saved
+    next to the m4b as <basename>.jpg instead.
 """
 
 import argparse
@@ -163,6 +178,33 @@ def install_temp_output(tmp_output: Path, output_path: Path):
     os.umask(umask)
     os.chmod(tmp_output, 0o666 & ~umask)
     os.replace(tmp_output, output_path)
+
+
+def install_cover_sidecar(cover_art: Path | None, output_path: Path):
+    """Write the cover next to the m4b as <basename>.jpg.
+
+    We no longer embed cover art in the m4b (see the mux comments for the
+    fragmented-MP4 + attached_pic failure mode). Audiobookshelf reads a
+    sidecar image with the same basename as the audio file, so this keeps
+    the cover visible in ABS/plappa without baking it into a stream that
+    can break under `+frag_keyframe`.
+    """
+    if cover_art is None:
+        return
+    sidecar = output_path.with_suffix(".jpg")
+    if cover_art.suffix.lower() in (".jpg", ".jpeg"):
+        shutil.copy2(cover_art, sidecar)
+    else:
+        # png/webp → re-encode to jpeg for maximum player/ABS compatibility.
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(cover_art),
+             "-c:v", "mjpeg", str(sidecar)],
+            check=True,
+        )
+    umask = os.umask(0)
+    os.umask(umask)
+    os.chmod(sidecar, 0o666 & ~umask)
+    print(f"🖼  Cover written to sidecar: {sidecar.name}")
 
 
 def metadata_missing(*, title, author, narrator, year, genre, description, cover_art):
@@ -978,33 +1020,41 @@ def retag(src: Path, args):
         mux_format = "ipod" if src_codec in {"aac", "mp3", "alac"} else "mp4"
 
         # Mux: audio + chapters from input via copy; metadata from our
-        # FFMETADATA file; cover from disk (re-attached as attached_pic so
-        # the disposition flag survives even when the source had embedded
-        # art with the wrong disposition).
+        # FFMETADATA file. Cover is NOT embedded here — see comment below.
+        #
+        # Why no embedded cover in retag mode:
+        #   Some retag sources (notably Audible AAC-LC AAX rips) have
+        #   truncated AudioSpecificConfig (extradata_size=2) baked into the
+        #   source m4b. Combining `-c:a copy` with `-c:v copy` of an
+        #   attached_pic stream under `+frag_keyframe` produces an output
+        #   whose audio stream is undecodable ("timescale not set" warning,
+        #   md5 of decoded PCM is empty). Dropping the embedded cover
+        #   (`-vn`) sidesteps this entirely. The cover gets saved as a
+        #   sidecar JPEG next to the output instead; Audiobookshelf reads
+        #   <basename>.jpg adjacent to <basename>.m4b for the cover, so the
+        #   UX is identical for the only consumer that matters here.
         cmd = [
             "ffmpeg", "-y", "-v", "error", "-nostats",
             "-i", str(src),
             "-f", "ffmetadata", "-i", str(metadata_path),
         ]
-        cover_idx = None
-        if cover_art:
-            cmd.extend(["-i", str(cover_art)])
-            cover_idx = 2
-
-        cmd.extend(["-map", "0:a"])
-        if cover_idx is not None:
-            cmd.extend(["-map", f"{cover_idx}:v:0", "-disposition:v:0", "attached_pic"])
-
         cmd.extend([
+            "-map", "0:a",
+            "-vn",
             "-map_metadata", "1",
             "-map_chapters", "0",
             "-c:a", "copy",
         ])
-        if cover_idx is not None:
-            cmd.extend(["-c:v", "mjpeg"])
 
+        # Fragmented MP4: `+frag_keyframe -frag_duration 5000000` moves the
+        # sample tables out of the initial moov into per-fragment moofs.
+        # For long audiobooks the initial moov drops from ~10 MB (per-frame
+        # stsz) to ~5 KB, which is what AVPlayer must fetch + parse before
+        # the first audio sample can play. Without this, iOS resume on a
+        # cold cellular connection takes 5–10s as the moov streams in.
         cmd.extend([
-            "-movflags", "+faststart",
+            "-movflags", "+faststart+frag_keyframe",
+            "-frag_duration", "5000000",
             "-f", mux_format,
             str(tmp_output),
         ])
@@ -1014,6 +1064,7 @@ def retag(src: Path, args):
         if result.returncode == 0:
             install_temp_output(tmp_output, output_path)
             tmp_output = None
+            install_cover_sidecar(cover_art, output_path)
             print(f"✅ Success! Created: {output_path}")
         else:
             print(f"❌ FFmpeg Error:\n{result.stderr}")
@@ -1359,35 +1410,41 @@ def main():
         )
 
         # Phase 5: mux. -c:a copy since encodes are already uniform AAC.
-        # -movflags +faststart moves the index to the file head so players
-        # can start playback without reading to EOF. -f ipod is the canonical
-        # m4b muxer. -progress pipe:1 streams out_time_us so we can show a
-        # real bar instead of a 30-second blank wait on big concat outputs.
+        # -f ipod is the canonical m4b muxer. -progress pipe:1 streams
+        # out_time_us so we can show a real bar instead of a 30-second
+        # blank wait on big concat outputs.
+        #
+        # Fragmentation: `+frag_keyframe -frag_duration 5000000` moves the
+        # sample tables out of the initial moov into per-fragment moofs.
+        # Without this, AAC-LC at 44.1 kHz produces ~43 frames/sec, and
+        # `stsz` alone runs ~4 bytes × nb_frames — for a 60-hour book that's
+        # ~37 MB of metadata the iOS player must fetch + parse before the
+        # first sample can play. With fragmentation the initial moov stays
+        # under ~10 KB, regardless of duration.
+        #
+        # Cover is written as a sidecar JPEG next to the m4b instead of
+        # embedded. Audiobookshelf reads <basename>.jpg adjacent to the
+        # m4b for the cover, so the UX is identical for the only consumer
+        # that matters here. Why not embed: fragmented MP4 + attached_pic
+        # is fragile (see retag()'s comment for the failure mode).
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-v", "error", "-nostats",
             "-f", "concat", "-safe", "0", "-i", str(concat_path),
             "-f", "ffmetadata", "-i", str(metadata_path),
         ]
         metadata_idx = 1
-        cover_idx = None
-        if cover_art:
-            ffmpeg_cmd.extend(["-i", str(cover_art)])
-            cover_idx = 2
-
-        ffmpeg_cmd.extend(["-map", "0:a:0"])
-        if cover_idx is not None:
-            ffmpeg_cmd.extend(["-map", f"{cover_idx}:v:0", "-disposition:v:0", "attached_pic"])
 
         ffmpeg_cmd.extend([
+            "-map", "0:a:0",
+            "-vn",
             "-map_metadata", str(metadata_idx),
             "-map_chapters", str(metadata_idx),
             "-c:a", "copy",
         ])
-        if cover_idx is not None:
-            ffmpeg_cmd.extend(["-c:v", "mjpeg"])
 
         ffmpeg_cmd.extend([
-            "-movflags", "+faststart",
+            "-movflags", "+faststart+frag_keyframe",
+            "-frag_duration", "5000000",
             "-f", "ipod",
             "-progress", "pipe:1",
             str(tmp_output),
@@ -1439,6 +1496,7 @@ def main():
         if proc.returncode == 0:
             install_temp_output(tmp_output, output_path)
             tmp_output = None
+            install_cover_sidecar(cover_art, output_path)
             print(f"✅ Success! Created: {output_path}")
         else:
             print(f"❌ FFmpeg Error:\n{''.join(err_chunks)}")
