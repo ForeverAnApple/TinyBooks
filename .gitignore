@@ -19,3 +19,6 @@ __pycache__/
 # Local Nix flake — not part of the audiobook converter project
 flake.nix
 flake.lock
+
+# env 
+.env
