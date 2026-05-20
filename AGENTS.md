@@ -10,8 +10,10 @@ A staging area for converting audiobook source material into m4b files using
 ├── make_m4b.py          # the converter — read its docstring before changing it
 ├── AGENTS.md            # this file
 ├── CLAUDE.md            # symlink → AGENTS.md
-├── processed/           # finished outputs: .m4b files (fragmented MP4) + sidecar
-│                        # <basename>.jpg cover next to each m4b
+├── processed/           # finished outputs: .m4b files (NON-fragmented, with
+│                        # cover embedded as covr atom in moov.udta). ABS
+│                        # auto-extracts the cover on library scan. No
+│                        # sidecar JPEGs.
 ├── raw/                 # source material: per-book directories of mp3s, plus the
 │                        # occasional loose source mp3 (e.g. Accelerando)
 ├── AudioBookConverter/  # third-party tool (separate git repo). NOT used by
@@ -125,15 +127,65 @@ Cover art priority for input: `--cover` > sidecar image in the source dir
 (`cover.*`/`folder.*`/`front.*` or the largest `.jpg`/`.png`/`.webp`) >
 embedded ID3 art on the first audio file.
 
-**Output**: cover is written as a sidecar `<basename>.jpg` adjacent to the
-m4b — *not* embedded into the m4b stream. Audiobookshelf reads sidecar
-JPEGs with matching basenames, so cover is visible to ABS/plappa without
-baking it into a video stream that breaks under `+frag_keyframe`. The
-muxer flags `+faststart+frag_keyframe -frag_duration 5000000` produce
-fragmented MP4 — required so iOS AVPlayer doesn't have to fetch a
-multi-MB sample-table moov before the first audio sample plays. See
-`make_m4b.py`'s top-of-file docstring under CORRECTNESS NOTES for the
-arithmetic on why this matters.
+**Output**: cover is embedded via ffmpeg's attached_pic stream
+(`-map cover:v -c:v mjpeg -disposition:v attached_pic`). The iPod muxer
+auto-writes it as a `covr` atom in `moov.udta` when given a non-
+fragmented output. ABS's prober reads the `covr` atom on scan. No
+sidecar JPEG is written.
+
+**Critical constraint: NO `+frag_keyframe`.** The muxer flags are
+`+faststart` only. ffmpeg + attached_pic + `+frag_keyframe` produces a
+broken chapter-image-track (`vide:0D000000`) and ABS misses the cover.
+The mutagen post-mux workaround tried previously corrupts moof tables
+and breaks audio decode after the first fragment (~5-10s). Non-frag +
+attached_pic in one ffmpeg pass is the only working combination.
+
+Trade-off: iOS cold-resume latency regresses ~1-3s for typical 10-15hr
+books vs. the fragmented version (moov ~5MB vs. ~10KB). Correctness
+wins. See `make_m4b.py`'s docstring for the exhaustive what-was-tried
+list.
+
+### Output quality checklist
+
+Every m4b in `processed/` is held to this bar. The pipeline must produce
+all of these or the build is incomplete:
+
+- **Highest quality**: encode uses uniform AAC matched to the source
+  (no upsampling mono voice to stereo, no downsampling 44.1 kHz to 22.05);
+  retag mode `-c copy` never re-encodes.
+- **Full metadata**: title, author, narrator (`composer`), year (`date`),
+  genre, description, plus series `album`+`grouping` when applicable. The
+  script refuses to produce a missing-metadata output for `processed/`
+  without `--allow-missing-metadata`.
+- **Large, well-made cover with no retailer branding**: minimum 2000×2000,
+  square preferred, no "Audible Original"/"Only From Audible"/Apple Books
+  bars. Default to running every candidate cover through the
+  `debrand-audiobook-cover` skill (Codex `image_gen`) to either remove
+  branding or outpaint a small/rectangular print scan to a 3000×3000
+  publisher-style master. Skip codex only when the source is already a
+  clean square ≥2000×2000 (e.g., iTunes Lookup
+  `…/3000x3000bb.jpg` masters that have no overlay).
+- **Mux: `+faststart` only, `-f ipod`, NO `+frag_keyframe`**. The
+  fragmentation flag breaks two things at once (chap-image-track instead
+  of covr atom, AND mutagen post-mux corruption); non-fragmented is the
+  only working configuration. iOS cold-resume regresses ~1-3s for
+  typical 10-15hr books — acceptable for correctness.
+- **Plays perfectly in ABS + decodes fully**: To verify a build:
+  - `MP4Box -info <file.m4b> | grep -E "tracks|cover:"` should show
+    `2 tracks` and `cover: JPEG File`. If you see `vide:0D000000`,
+    the cover was misembedded and ABS will miss it.
+  - `ffmpeg -v error -i <file.m4b> -vn -f null -` MUST run to
+    completion with no errors. If it dies partway (typically ~5-10s
+    in), the moof/sample-table structure is corrupt — usually from a
+    mutagen post-mux attempt on a fragmented file. Rebuild
+    non-fragmented.
+  After dropping new files into `processed/`, trigger a library scan
+  (`curl -X POST -H "Authorization: Bearer $SWORDJAILER_ABS_KEY"
+  https://abs.jura.moe/api/libraries/f79124f1-c073-4a47-b172-4d18b0b5fb5f/scan`)
+  and ABS will pick up the m4b and its embedded cover together.
+
+Token for the scan endpoint lives in `.env` (gitignored) as
+`SWORDJAILER_ABS_KEY`.
 
 ### Filling metadata before encoding
 

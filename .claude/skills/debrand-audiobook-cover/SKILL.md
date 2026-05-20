@@ -50,8 +50,8 @@ you always need that final shell step.
 ```
 Step 1: call `view_image` on /tmp/cover_cleanup/<book-slug>/input_branded.jpg.
 Step 2: call `image_gen` to edit that loaded image with the prompt below.
-Step 3: find the newest file under $CODEX_HOME/generated_images/ and ffmpeg-encode it to /tmp/cover_cleanup/<book-slug>/output_clean.jpg (3000x3000 JPEG, -q:v 2).
-Step 4: print "SUCCESS" (or "FAILED: <reason>").
+Step 3: locate the generated PNG. Read your own session_id (codex prints it at startup) and only look inside `$CODEX_HOME/generated_images/$SESSION_ID/` for `ig_*.png`. Do NOT fall back to the newest mtime in the parent directory — if image_gen failed silently for your session, that fallback will pick up a stale image from a totally unrelated past session and silently report SUCCESS (verified bug, May 2026 — caused the wrong book's cover to be embedded). If no PNG exists in your session dir, print "FAILED: image_gen produced no output for session $SESSION_ID" and stop.
+Step 4: ffmpeg-encode the PNG to /tmp/cover_cleanup/<book-slug>/output_clean.jpg (3000x3000 JPEG, -q:v 2), then print "SUCCESS" (or "FAILED: <reason>").
 
 Do NOT read /home/faa/.codex/skills/.system/imagegen/SKILL.md — you already know the workflow. Do NOT use the CLI fallback (scripts/image_gen.py). Use ONLY the built-in `image_gen` tool — no OPENAI_API_KEY needed.
 
