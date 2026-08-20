@@ -99,7 +99,12 @@ CORRECTNESS NOTES
   - Chapter timestamps are built from *encoded* durations (not source) so
     they land exactly where the audio lands after concat.
   - Final outputs are written to a temporary sibling file and atomically moved
-    into place only after ffmpeg succeeds. Existing outputs require --force.
+    into place only after ffmpeg succeeds (same filesystem — required for
+    os.replace). Existing outputs require --force.
+  - Intermediate chapter encodes go to an mkdtemp dir under the system temp
+    dir (default), never the output dir, so the library folder never sees
+    work-in-progress (Audiobookshelf's folder monitor would otherwise index
+    stray `make_m4b_*` dirs as phantom media).
 
 WHY NOT …
 ---------
@@ -164,8 +169,13 @@ def validate_output_path(path: Path, *, force: bool):
         raise SystemExit(f"❌ Output already exists: {path} (pass --force to replace it)")
 
 
-def make_temp_dir(prefix: str, output_path: Path, tmp_dir_arg=None) -> Path:
-    base = Path(tmp_dir_arg).expanduser() if tmp_dir_arg else output_path.parent
+def make_temp_dir(prefix: str, tmp_dir_arg=None) -> Path:
+    # Default to the system temp dir (e.g. /tmp), NOT the output directory:
+    # a crashed run would otherwise leave a stray `make_m4b_*` work dir
+    # inside the library folder, where folder monitors (Audiobookshelf)
+    # pick it up as phantom media. Override with --tmp-dir if you need
+    # the work files on a specific volume.
+    base = Path(tmp_dir_arg).expanduser() if tmp_dir_arg else Path(tempfile.gettempdir())
     if not base.exists():
         raise SystemExit(f"❌ Temp directory does not exist: {base}")
     if not base.is_dir():
@@ -902,7 +912,7 @@ def retag(src: Path, args):
     )
     print("📐 Mode: retag (existing m4b)")
 
-    tmpdir = make_temp_dir("make_m4b_retag_", output_path, args.tmp_dir)
+    tmpdir = make_temp_dir("make_m4b_retag_", args.tmp_dir)
     tmp_output = make_temp_output_path(output_path)
     try:
         # Cover priority: --cover > sidecar in parent > extracted embedded.
@@ -1085,7 +1095,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4,
                         help="Parallel encode workers (default: cpu count)")
     parser.add_argument("--tmp-dir",
-                        help="Directory for temporary encoded chapters (default: output directory)")
+                        help="Directory for temporary encoded chapters (default: system temp dir, e.g. /tmp)")
     parser.add_argument("--force", action="store_true",
                         help="Replace an existing output file")
     parser.add_argument("--allow-missing-metadata", action="store_true",
@@ -1175,7 +1185,7 @@ def main():
     }
     print(f"📐 Layout: {layout_labels.get(layout, layout)}")
 
-    tmpdir = make_temp_dir("make_m4b_", output_path, args.tmp_dir)
+    tmpdir = make_temp_dir("make_m4b_", args.tmp_dir)
     tmp_output = make_temp_output_path(output_path)
 
     try:
